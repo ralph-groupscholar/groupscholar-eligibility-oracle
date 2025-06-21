@@ -1,0 +1,19 @@
+# Eligibility rules for Group Scholar intake audits
+
+[required]
+fields=id,first_name,last_name,email,gpa,grad_year,status,dob
+
+[range:gpa]
+min=2.5
+max=4.0
+
+[range:grad_year]
+min=2024
+max=2030
+
+[allowed:status]
+values=eligible,conditional
+
+[date:dob]
+earliest=1998-01-01
+latest=2008-12-31
