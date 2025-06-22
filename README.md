@@ -6,6 +6,7 @@ Eligibility Oracle is a lightweight Java CLI that audits applicant intake CSVs a
 - Parses CSV intakes without external dependencies
 - Rules file supports required fields, numeric ranges, allowed values, and date windows
 - Outputs concise text summaries or JSON for downstream workflows
+- Supports custom applicant ID fields and optional failure list limits
 - Includes sample data and rules for fast iteration
 
 ## Quickstart
@@ -16,6 +17,10 @@ Eligibility Oracle is a lightweight Java CLI that audits applicant intake CSVs a
 
 ```bash
 ./scripts/run.sh --input data/sample-intake.csv --rules data/rules.txt --format json --output reports/eligibility.json
+```
+
+```bash
+./scripts/run.sh --input data/sample-intake.csv --rules data/rules.txt --id-field applicant_id --limit 25
 ```
 
 ## Rules file format

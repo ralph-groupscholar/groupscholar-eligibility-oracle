@@ -31,8 +31,10 @@ public class EligibilityOracle {
         String outputPath = options.get("output");
 
         try {
-            RuleSet rules = RuleSet.load(rulesPath);
-            AuditResult result = audit(inputPath, rules);
+        RuleSet rules = RuleSet.load(rulesPath);
+        String idField = options.getOrDefault("id-field", "id");
+        int limit = parseIntOption(options.get("limit"), -1);
+        AuditResult result = audit(inputPath, rules, idField, limit);
             String report = format.equals("json") ? renderJson(result) : renderText(result);
             if (outputPath == null) {
                 System.out.println(report);
@@ -47,12 +49,14 @@ public class EligibilityOracle {
 
     private static void printUsage() {
         System.out.println("Group Scholar Eligibility Oracle");
-        System.out.println("Usage: java -cp src EligibilityOracle --input <file.csv> --rules <rules.txt> [--format text|json] [--output report.txt]");
+        System.out.println("Usage: java -cp src EligibilityOracle --input <file.csv> --rules <rules.txt> [--format text|json] [--output report.txt] [--id-field field] [--limit N]");
         System.out.println("Options:");
         System.out.println("  --input   Path to applicant intake CSV");
         System.out.println("  --rules   Path to eligibility rules file");
         System.out.println("  --format  text (default) or json");
         System.out.println("  --output  Optional output file path");
+        System.out.println("  --id-field Field name to use for applicant identifiers (default: id)");
+        System.out.println("  --limit   Limit number of ineligible applicants listed (default: no limit)");
     }
 
     private static Map<String, String> parseArgs(String[] args) {
@@ -71,7 +75,7 @@ public class EligibilityOracle {
         return options;
     }
 
-    private static AuditResult audit(Path inputPath, RuleSet rules) throws IOException {
+    private static AuditResult audit(Path inputPath, RuleSet rules, String idField, int limit) throws IOException {
         List<String> lines = Files.readAllLines(inputPath, StandardCharsets.UTF_8);
         if (lines.isEmpty()) {
             throw new IOException("Input CSV is empty.");
@@ -86,6 +90,8 @@ public class EligibilityOracle {
 
         AuditResult result = new AuditResult();
         result.totalRows = Math.max(0, lines.size() - 1);
+        result.failureLimit = limit;
+        result.idField = normalize(idField);
 
         for (int i = 1; i < lines.size(); i++) {
             List<String> row = parseCsvLine(lines.get(i));
@@ -147,14 +153,20 @@ public class EligibilityOracle {
                 }
             }
 
-            String id = rowMap.getOrDefault("id", "row-" + i);
+            String id = rowMap.getOrDefault(result.idField, "row-" + i);
             if (reasons.isEmpty()) {
                 result.eligible++;
             } else {
                 result.ineligible++;
-                result.failures.add(new FailureRecord(id, reasons));
+                if (result.failureLimit < 0 || result.failures.size() < result.failureLimit) {
+                    result.failures.add(new FailureRecord(id, reasons));
+                } else {
+                    result.failuresTruncated = true;
+                }
                 for (String reason : reasons) {
                     result.reasonCounts.put(reason, result.reasonCounts.getOrDefault(reason, 0) + 1);
+                    String category = reason.split(":", 2)[0];
+                    result.reasonCategoryCounts.put(category, result.reasonCategoryCounts.getOrDefault(category, 0) + 1);
                 }
             }
         }
@@ -194,8 +206,17 @@ public class EligibilityOracle {
         StringBuilder sb = new StringBuilder();
         sb.append("Eligibility Audit Summary\n");
         sb.append("Total applicants: ").append(result.totalRows).append("\n");
-        sb.append("Eligible: ").append(result.eligible).append("\n");
-        sb.append("Ineligible: ").append(result.ineligible).append("\n\n");
+        sb.append("Eligible: ").append(result.eligible).append(" (").append(formatRate(result.eligible, result.totalRows)).append(")\n");
+        sb.append("Ineligible: ").append(result.ineligible).append(" (").append(formatRate(result.ineligible, result.totalRows)).append(")\n\n");
+
+        if (!result.reasonCategoryCounts.isEmpty()) {
+            sb.append("Reason categories:\n");
+            result.reasonCategoryCounts.entrySet().stream()
+                    .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+                    .forEach(entry -> sb.append("- ").append(entry.getKey())
+                            .append(": ").append(entry.getValue()).append("\n"));
+            sb.append("\n");
+        }
 
         if (!result.reasonCounts.isEmpty()) {
             sb.append("Top ineligibility reasons:\n");
@@ -207,10 +228,21 @@ public class EligibilityOracle {
         }
 
         if (!result.failures.isEmpty()) {
-            sb.append("Ineligible applicants:\n");
+            sb.append("Ineligible applicants:");
+            if (result.failureLimit >= 0) {
+                sb.append(" (showing ").append(result.failures.size());
+                if (result.failuresTruncated) {
+                    sb.append(" of ").append(result.ineligible);
+                }
+                sb.append(")");
+            }
+            sb.append("\n");
             for (FailureRecord record : result.failures) {
                 sb.append("- ").append(record.id).append(": ")
                         .append(String.join(", ", record.reasons)).append("\n");
+            }
+            if (result.failuresTruncated) {
+                sb.append("... truncated\n");
             }
         }
 
@@ -222,7 +254,24 @@ public class EligibilityOracle {
         sb.append("{\n");
         sb.append("  \"totalApplicants\": ").append(result.totalRows).append(",\n");
         sb.append("  \"eligible\": ").append(result.eligible).append(",\n");
+        sb.append("  \"eligibleRate\": ").append(formatRateValue(result.eligible, result.totalRows)).append(",\n");
         sb.append("  \"ineligible\": ").append(result.ineligible).append(",\n");
+        sb.append("  \"ineligibleRate\": ").append(formatRateValue(result.ineligible, result.totalRows)).append(",\n");
+        sb.append("  \"idField\": \"").append(escapeJson(result.idField)).append("\",\n");
+        sb.append("  \"failureLimit\": ").append(result.failureLimit).append(",\n");
+        sb.append("  \"failuresTruncated\": ").append(result.failuresTruncated).append(",\n");
+        sb.append("  \"reasonCategories\": {");
+        if (!result.reasonCategoryCounts.isEmpty()) {
+            sb.append("\n");
+            int catIdx = 0;
+            for (Map.Entry<String, Integer> entry : result.reasonCategoryCounts.entrySet()) {
+                sb.append("    \"").append(escapeJson(entry.getKey())).append("\": ").append(entry.getValue());
+                catIdx++;
+                sb.append(catIdx < result.reasonCategoryCounts.size() ? ",\n" : "\n");
+            }
+            sb.append("  ");
+        }
+        sb.append("},\n");
         sb.append("  \"reasonCounts\": {");
         if (!result.reasonCounts.isEmpty()) {
             sb.append("\n");
@@ -278,7 +327,11 @@ public class EligibilityOracle {
         int eligible = 0;
         int ineligible = 0;
         Map<String, Integer> reasonCounts = new LinkedHashMap<>();
+        Map<String, Integer> reasonCategoryCounts = new LinkedHashMap<>();
         List<FailureRecord> failures = new ArrayList<>();
+        int failureLimit = -1;
+        boolean failuresTruncated = false;
+        String idField = "id";
     }
 
     private static class FailureRecord {
@@ -385,6 +438,33 @@ public class EligibilityOracle {
                 results.add(part.trim().toLowerCase(Locale.ROOT).replace(" ", "_"));
             }
             return results;
+        }
+    }
+
+    private static String formatRate(int count, int total) {
+        if (total == 0) {
+            return "0.00%";
+        }
+        double rate = (count * 100.0) / total;
+        return String.format(Locale.ROOT, "%.2f%%", rate);
+    }
+
+    private static String formatRateValue(int count, int total) {
+        if (total == 0) {
+            return "0";
+        }
+        double rate = (count * 1.0) / total;
+        return String.format(Locale.ROOT, "%.4f", rate);
+    }
+
+    private static int parseIntOption(String value, int fallback) {
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
         }
     }
 }
