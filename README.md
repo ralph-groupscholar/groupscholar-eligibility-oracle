@@ -5,6 +5,7 @@ Eligibility Oracle is a lightweight Java CLI that audits applicant intake CSVs a
 ## Features
 - Parses CSV intakes without external dependencies
 - Rules file supports required fields, numeric ranges, allowed values, and date windows
+- Supports regex pattern validation for fields like email or IDs
 - Outputs concise text summaries or JSON for downstream workflows
 - Supports custom applicant ID fields and optional failure list limits
 - Includes sample data and rules for fast iteration
@@ -43,6 +44,9 @@ values=eligible,conditional
 [date:dob]
 earliest=1998-01-01
 latest=2008-12-31
+
+[pattern:email]
+regex=^.+@.+\\..+$
 ```
 
 ## Tech

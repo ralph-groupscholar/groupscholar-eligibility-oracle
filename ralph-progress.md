@@ -9,3 +9,7 @@
 - Added eligibility rate percentages and reason category summaries to the audit output.
 - Introduced configurable applicant ID fields and optional failure list limits.
 - Expanded JSON output with rate metrics, category counts, and truncation metadata.
+
+## Iteration 33
+- Added regex pattern rules (e.g., email validation) to eligibility audits.
+- Updated sample rules/data and README documentation for pattern checks.

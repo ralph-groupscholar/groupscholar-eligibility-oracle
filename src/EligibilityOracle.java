@@ -16,6 +16,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 public class EligibilityOracle {
     public static void main(String[] args) {
@@ -150,6 +152,17 @@ public class EligibilityOracle {
                     }
                 } catch (DateTimeParseException e) {
                     reasons.add("invalid_date:" + field);
+                }
+            }
+
+            for (Map.Entry<String, Pattern> entry : rules.patternRules.entrySet()) {
+                String field = entry.getKey();
+                String value = rowMap.getOrDefault(field, "");
+                if (value.isBlank()) {
+                    continue;
+                }
+                if (!entry.getValue().matcher(value).matches()) {
+                    reasons.add("invalid_pattern:" + field);
                 }
             }
 
@@ -369,6 +382,7 @@ public class EligibilityOracle {
         Map<String, NumericRange> numericRanges = new LinkedHashMap<>();
         Map<String, Set<String>> allowedValues = new LinkedHashMap<>();
         Map<String, DateRange> dateRanges = new LinkedHashMap<>();
+        Map<String, Pattern> patternRules = new LinkedHashMap<>();
 
         static RuleSet load(Path path) throws IOException {
             RuleSet rules = new RuleSet();
@@ -422,6 +436,15 @@ public class EligibilityOracle {
                         latest = LocalDate.parse(value);
                     }
                     rules.dateRanges.put(field, new DateRange(earliest, latest));
+                } else if (section.startsWith("pattern:")) {
+                    String field = section.substring("pattern:".length());
+                    if (key.equals("regex")) {
+                        try {
+                            rules.patternRules.put(field, Pattern.compile(value));
+                        } catch (PatternSyntaxException e) {
+                            throw new IOException("Invalid regex for pattern:" + field + " -> " + e.getMessage(), e);
+                        }
+                    }
                 }
             }
             rules.requiredFields.replaceAll(EligibilityOracle::normalize);
