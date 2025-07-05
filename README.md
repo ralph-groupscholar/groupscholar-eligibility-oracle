@@ -46,7 +46,7 @@ earliest=1998-01-01
 latest=2008-12-31
 
 [pattern:email]
-regex=^.+@.+\\..+$
+regex=^.+@.+\..+$
 ```
 
 ## Tech
