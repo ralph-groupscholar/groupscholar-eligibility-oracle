@@ -112,6 +112,18 @@ public class EligibilityOracle {
                 }
             }
 
+            for (ConditionalRequirement requirement : rules.conditionalRequirements) {
+                String value = normalizeValue(rowMap.getOrDefault(requirement.conditionField, ""));
+                if (value.equals(requirement.conditionValue)) {
+                    for (String needed : requirement.requiredFields) {
+                        String requiredValue = rowMap.getOrDefault(needed, "");
+                        if (requiredValue.isBlank()) {
+                            reasons.add("missing_if:" + requirement.conditionField + "=" + requirement.conditionValue + ":" + needed);
+                        }
+                    }
+                }
+            }
+
             for (Map.Entry<String, NumericRange> entry : rules.numericRanges.entrySet()) {
                 String field = entry.getKey();
                 String value = rowMap.getOrDefault(field, "");
@@ -212,6 +224,10 @@ public class EligibilityOracle {
     }
 
     private static String normalize(String value) {
+        return value.trim().toLowerCase(Locale.ROOT).replace(" ", "_");
+    }
+
+    private static String normalizeValue(String value) {
         return value.trim().toLowerCase(Locale.ROOT).replace(" ", "_");
     }
 
@@ -379,6 +395,7 @@ public class EligibilityOracle {
 
     private static class RuleSet {
         List<String> requiredFields = new ArrayList<>();
+        List<ConditionalRequirement> conditionalRequirements = new ArrayList<>();
         Map<String, NumericRange> numericRanges = new LinkedHashMap<>();
         Map<String, Set<String>> allowedValues = new LinkedHashMap<>();
         Map<String, DateRange> dateRanges = new LinkedHashMap<>();
@@ -388,6 +405,7 @@ public class EligibilityOracle {
             RuleSet rules = new RuleSet();
             List<String> lines = Files.readAllLines(path, StandardCharsets.UTF_8);
             String section = "";
+            Map<String, ConditionalRequirement> conditionalLookup = new LinkedHashMap<>();
             for (String raw : lines) {
                 String line = raw.trim();
                 if (line.isEmpty() || line.startsWith("#")) {
@@ -406,6 +424,22 @@ public class EligibilityOracle {
                 if (section.equals("required")) {
                     if (key.equals("fields")) {
                         rules.requiredFields = normalizeList(value);
+                    }
+                } else if (section.startsWith("require_if:")) {
+                    if (key.equals("fields")) {
+                        String condition = section.substring("require_if:".length());
+                        String[] conditionParts = condition.split("=", 2);
+                        if (conditionParts.length == 2) {
+                            String conditionField = normalize(conditionParts[0]);
+                            String conditionValue = normalizeValue(conditionParts[1]);
+                            String conditionKey = conditionField + "=" + conditionValue;
+                            ConditionalRequirement requirement = conditionalLookup.get(conditionKey);
+                            if (requirement == null) {
+                                requirement = new ConditionalRequirement(conditionField, conditionValue);
+                                conditionalLookup.put(conditionKey, requirement);
+                            }
+                            requirement.requiredFields.addAll(normalizeList(value));
+                        }
                     }
                 } else if (section.startsWith("range:")) {
                     String field = section.substring("range:".length());
@@ -447,6 +481,7 @@ public class EligibilityOracle {
                     }
                 }
             }
+            rules.conditionalRequirements.addAll(conditionalLookup.values());
             rules.requiredFields.replaceAll(EligibilityOracle::normalize);
             return rules;
         }
@@ -458,9 +493,20 @@ public class EligibilityOracle {
             String[] parts = value.split(",");
             List<String> results = new ArrayList<>();
             for (String part : parts) {
-                results.add(part.trim().toLowerCase(Locale.ROOT).replace(" ", "_"));
+                results.add(normalizeValue(part));
             }
             return results;
+        }
+    }
+
+    private static class ConditionalRequirement {
+        String conditionField;
+        String conditionValue;
+        List<String> requiredFields = new ArrayList<>();
+
+        ConditionalRequirement(String conditionField, String conditionValue) {
+            this.conditionField = conditionField;
+            this.conditionValue = conditionValue;
         }
     }
 

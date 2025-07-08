@@ -3,6 +3,9 @@
 [required]
 fields=id,first_name,last_name,email,gpa,grad_year,status,dob
 
+[require_if:status=conditional]
+fields=review_notes
+
 [range:gpa]
 min=2.5
 max=4.0
