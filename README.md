@@ -24,6 +24,27 @@ Eligibility Oracle is a lightweight Java CLI that audits applicant intake CSVs a
 ./scripts/run.sh --input data/sample-intake.csv --rules data/rules.txt --id-field applicant_id --limit 25
 ```
 
+## Database logging (optional)
+
+The Oracle can log audit summaries to Postgres for dashboards or longitudinal tracking.
+
+```bash
+export ELIGIBILITY_DB_URL="jdbc:postgresql://db-acupinir.groupscholar.com:23947/postgres?sslmode=require"
+export ELIGIBILITY_DB_USER="ralph"
+export ELIGIBILITY_DB_PASSWORD="your-password"
+export ELIGIBILITY_DB_SCHEMA="eligibility_oracle"
+
+./scripts/run.sh --input data/sample-intake.csv --rules data/rules.txt --log-db --run-name "fall-2026-import"
+```
+
+Seed the production schema once (writes a sample run + failures):
+
+```bash
+./scripts/seed-db.py
+```
+
+`seed-db.py` accepts the same `ELIGIBILITY_DB_URL` and will strip a leading `jdbc:` prefix if present.
+
 ## Rules file format
 
 ```
@@ -51,7 +72,8 @@ regex=^.+@.+\..+$
 
 ## Tech
 - Java (standard library)
+- PostgreSQL (optional analytics logging)
 - Shell script wrapper
 
 ## Project notes
-Store new rules in `data/` and keep outputs in `reports/` for consistency.
+Store new rules in `data/` and keep outputs in `reports/` for consistency. The Postgres JDBC driver lives in `lib/`.

@@ -1,5 +1,10 @@
 # Ralph Progress Log
 
+## Iteration 39
+- Added optional Postgres logging for audit runs, reasons, and failure details.
+- Included JDBC driver + updated runner to load the lib classpath.
+- Added a seed script and documented database setup in the README.
+
 ## Iteration 30
 - Created the Eligibility Oracle Java CLI to audit intake CSVs against configurable rules.
 - Added a sample intake CSV, a rules template, and a shell runner for quick usage.

@@ -4,4 +4,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 mkdir -p build
 javac -d build src/EligibilityOracle.java
-java -cp build EligibilityOracle "$@"
+CP="build"
+if [ -d "lib" ]; then
+  CP="build:lib/*"
+fi
+java -cp "$CP" EligibilityOracle "$@"

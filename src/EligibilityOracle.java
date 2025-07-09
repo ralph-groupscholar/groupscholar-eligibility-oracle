@@ -5,6 +5,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -15,7 +16,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
+import java.sql.Array;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -31,17 +39,22 @@ public class EligibilityOracle {
         Path rulesPath = Path.of(options.get("rules"));
         String format = options.getOrDefault("format", "text").toLowerCase(Locale.ROOT);
         String outputPath = options.get("output");
+        boolean logDb = options.containsKey("log-db");
+        String runName = options.get("run-name");
 
         try {
-        RuleSet rules = RuleSet.load(rulesPath);
-        String idField = options.getOrDefault("id-field", "id");
-        int limit = parseIntOption(options.get("limit"), -1);
-        AuditResult result = audit(inputPath, rules, idField, limit);
+            RuleSet rules = RuleSet.load(rulesPath);
+            String idField = options.getOrDefault("id-field", "id");
+            int limit = parseIntOption(options.get("limit"), -1);
+            AuditResult result = audit(inputPath, rules, idField, limit);
             String report = format.equals("json") ? renderJson(result) : renderText(result);
             if (outputPath == null) {
                 System.out.println(report);
             } else {
                 Files.writeString(Path.of(outputPath), report, StandardCharsets.UTF_8);
+            }
+            if (logDb) {
+                logToDatabase(result, inputPath, rulesPath, runName);
             }
         } catch (IOException e) {
             System.err.println("Error: " + e.getMessage());
@@ -51,7 +64,7 @@ public class EligibilityOracle {
 
     private static void printUsage() {
         System.out.println("Group Scholar Eligibility Oracle");
-        System.out.println("Usage: java -cp src EligibilityOracle --input <file.csv> --rules <rules.txt> [--format text|json] [--output report.txt] [--id-field field] [--limit N]");
+        System.out.println("Usage: java -cp src EligibilityOracle --input <file.csv> --rules <rules.txt> [--format text|json] [--output report.txt] [--id-field field] [--limit N] [--log-db] [--run-name name]");
         System.out.println("Options:");
         System.out.println("  --input   Path to applicant intake CSV");
         System.out.println("  --rules   Path to eligibility rules file");
@@ -59,6 +72,8 @@ public class EligibilityOracle {
         System.out.println("  --output  Optional output file path");
         System.out.println("  --id-field Field name to use for applicant identifiers (default: id)");
         System.out.println("  --limit   Limit number of ineligible applicants listed (default: no limit)");
+        System.out.println("  --log-db  Write audit summary + failures to the Postgres analytics schema");
+        System.out.println("  --run-name Optional label to store alongside the audit run");
     }
 
     private static Map<String, String> parseArgs(String[] args) {
@@ -69,9 +84,14 @@ public class EligibilityOracle {
                 options.put("help", "true");
                 return options;
             }
-            if (arg.startsWith("--") && i + 1 < args.length) {
-                options.put(arg.substring(2), args[i + 1]);
-                i++;
+            if (arg.startsWith("--")) {
+                String key = arg.substring(2);
+                if (i + 1 < args.length && !args[i + 1].startsWith("--")) {
+                    options.put(key, args[i + 1]);
+                    i++;
+                } else {
+                    options.put(key, "true");
+                }
             }
         }
         return options;
@@ -335,6 +355,148 @@ public class EligibilityOracle {
         return sb.toString();
     }
 
+    private static void logToDatabase(AuditResult result, Path inputPath, Path rulesPath, String runName) {
+        DbConfig config = DbConfig.fromEnv();
+        if (!config.enabled) {
+            System.err.println("DB logging requested but ELIGIBILITY_DB_URL is not set.");
+            return;
+        }
+
+        Properties props = new Properties();
+        if (config.user != null && !config.user.isBlank()) {
+            props.setProperty("user", config.user);
+        }
+        if (config.password != null && !config.password.isBlank()) {
+            props.setProperty("password", config.password);
+        }
+
+        try (Connection conn = DriverManager.getConnection(config.url, props)) {
+            conn.setAutoCommit(false);
+            ensureSchema(conn, config.schema);
+            long runId = insertAuditRun(conn, config.schema, result, inputPath, rulesPath, runName);
+            insertReasonCounts(conn, config.schema, runId, result.reasonCounts, "audit_reason_counts", "reason");
+            insertReasonCounts(conn, config.schema, runId, result.reasonCategoryCounts, "audit_reason_categories", "category");
+            insertFailures(conn, config.schema, runId, result.failures);
+            conn.commit();
+            System.err.println("Logged audit to DB (run_id=" + runId + ").");
+        } catch (SQLException e) {
+            System.err.println("DB logging failed: " + e.getMessage());
+        }
+    }
+
+    private static void ensureSchema(Connection conn, String schema) throws SQLException {
+        try (PreparedStatement stmt = conn.prepareStatement("CREATE SCHEMA IF NOT EXISTS " + schema)) {
+            stmt.execute();
+        }
+        String runsSql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_runs (" +
+                "id BIGSERIAL PRIMARY KEY," +
+                "run_at TIMESTAMPTZ NOT NULL," +
+                "run_name TEXT," +
+                "input_file TEXT," +
+                "rules_file TEXT," +
+                "total_applicants INT NOT NULL," +
+                "eligible INT NOT NULL," +
+                "ineligible INT NOT NULL," +
+                "eligible_rate NUMERIC(6,4) NOT NULL," +
+                "ineligible_rate NUMERIC(6,4) NOT NULL," +
+                "id_field TEXT NOT NULL," +
+                "failure_limit INT," +
+                "failures_truncated BOOLEAN NOT NULL" +
+                ")";
+        String reasonSql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_reason_counts (" +
+                "run_id BIGINT REFERENCES " + schema + ".audit_runs(id) ON DELETE CASCADE," +
+                "reason TEXT NOT NULL," +
+                "count INT NOT NULL" +
+                ")";
+        String categorySql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_reason_categories (" +
+                "run_id BIGINT REFERENCES " + schema + ".audit_runs(id) ON DELETE CASCADE," +
+                "category TEXT NOT NULL," +
+                "count INT NOT NULL" +
+                ")";
+        String failureSql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_failures (" +
+                "run_id BIGINT REFERENCES " + schema + ".audit_runs(id) ON DELETE CASCADE," +
+                "applicant_id TEXT NOT NULL," +
+                "reasons TEXT[] NOT NULL" +
+                ")";
+        try (PreparedStatement stmt = conn.prepareStatement(runsSql)) {
+            stmt.execute();
+        }
+        try (PreparedStatement stmt = conn.prepareStatement(reasonSql)) {
+            stmt.execute();
+        }
+        try (PreparedStatement stmt = conn.prepareStatement(categorySql)) {
+            stmt.execute();
+        }
+        try (PreparedStatement stmt = conn.prepareStatement(failureSql)) {
+            stmt.execute();
+        }
+    }
+
+    private static long insertAuditRun(Connection conn, String schema, AuditResult result, Path inputPath, Path rulesPath, String runName) throws SQLException {
+        double eligibleRate = result.totalRows == 0 ? 0.0 : (result.eligible * 1.0) / result.totalRows;
+        double ineligibleRate = result.totalRows == 0 ? 0.0 : (result.ineligible * 1.0) / result.totalRows;
+        String sql = "INSERT INTO " + schema + ".audit_runs " +
+                "(run_at, run_name, input_file, rules_file, total_applicants, eligible, ineligible, eligible_rate, ineligible_rate, id_field, failure_limit, failures_truncated) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id";
+        try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setObject(1, OffsetDateTime.now());
+            stmt.setString(2, runName);
+            stmt.setString(3, inputPath.toString());
+            stmt.setString(4, rulesPath.toString());
+            stmt.setInt(5, result.totalRows);
+            stmt.setInt(6, result.eligible);
+            stmt.setInt(7, result.ineligible);
+            stmt.setBigDecimal(8, java.math.BigDecimal.valueOf(eligibleRate));
+            stmt.setBigDecimal(9, java.math.BigDecimal.valueOf(ineligibleRate));
+            stmt.setString(10, result.idField);
+            if (result.failureLimit >= 0) {
+                stmt.setInt(11, result.failureLimit);
+            } else {
+                stmt.setNull(11, java.sql.Types.INTEGER);
+            }
+            stmt.setBoolean(12, result.failuresTruncated);
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getLong(1);
+                }
+            }
+        }
+        throw new SQLException("Failed to insert audit run row.");
+    }
+
+    private static void insertReasonCounts(Connection conn, String schema, long runId, Map<String, Integer> counts, String table, String keyColumn) throws SQLException {
+        if (counts.isEmpty()) {
+            return;
+        }
+        String sql = "INSERT INTO " + schema + "." + table + " (run_id, " + keyColumn + ", count) VALUES (?, ?, ?)";
+        try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+            for (Map.Entry<String, Integer> entry : counts.entrySet()) {
+                stmt.setLong(1, runId);
+                stmt.setString(2, entry.getKey());
+                stmt.setInt(3, entry.getValue());
+                stmt.addBatch();
+            }
+            stmt.executeBatch();
+        }
+    }
+
+    private static void insertFailures(Connection conn, String schema, long runId, List<FailureRecord> failures) throws SQLException {
+        if (failures.isEmpty()) {
+            return;
+        }
+        String sql = "INSERT INTO " + schema + ".audit_failures (run_id, applicant_id, reasons) VALUES (?, ?, ?)";
+        try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+            for (FailureRecord record : failures) {
+                stmt.setLong(1, runId);
+                stmt.setString(2, record.id);
+                Array reasonArray = conn.createArrayOf("text", record.reasons.toArray());
+                stmt.setArray(3, reasonArray);
+                stmt.addBatch();
+            }
+            stmt.executeBatch();
+        }
+    }
+
     private static String escapeJson(String value) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < value.length(); i++) {
@@ -361,6 +523,25 @@ public class EligibilityOracle {
         int failureLimit = -1;
         boolean failuresTruncated = false;
         String idField = "id";
+    }
+
+    private static class DbConfig {
+        boolean enabled;
+        String url;
+        String user;
+        String password;
+        String schema;
+
+        static DbConfig fromEnv() {
+            DbConfig config = new DbConfig();
+            config.url = System.getenv("ELIGIBILITY_DB_URL");
+            config.user = System.getenv("ELIGIBILITY_DB_USER");
+            config.password = System.getenv("ELIGIBILITY_DB_PASSWORD");
+            String schema = System.getenv("ELIGIBILITY_DB_SCHEMA");
+            config.schema = (schema == null || schema.isBlank()) ? "eligibility_oracle" : schema.trim();
+            config.enabled = config.url != null && !config.url.isBlank();
+            return config;
+        }
     }
 
     private static class FailureRecord {
