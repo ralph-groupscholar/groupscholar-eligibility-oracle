@@ -47,6 +47,9 @@ public class EligibilityOracle {
             String idField = options.getOrDefault("id-field", "id");
             int limit = parseIntOption(options.get("limit"), -1);
             AuditResult result = audit(inputPath, rules, idField, limit);
+            result.runName = runName == null ? "" : runName;
+            result.inputPath = inputPath.toString();
+            result.rulesPath = rulesPath.toString();
             String report = format.equals("json") ? renderJson(result) : renderText(result);
             if (outputPath == null) {
                 System.out.println(report);
@@ -105,15 +108,12 @@ public class EligibilityOracle {
 
         String headerLine = lines.get(0);
         List<String> headers = parseCsvLine(headerLine);
-        Map<String, Integer> headerIndex = new HashMap<>();
-        for (int i = 0; i < headers.size(); i++) {
-            headerIndex.put(normalize(headers.get(i)), i);
-        }
-
         AuditResult result = new AuditResult();
         result.totalRows = Math.max(0, lines.size() - 1);
         result.failureLimit = limit;
         result.idField = normalize(idField);
+        List<RowRecord> rows = new ArrayList<>();
+        Map<String, Map<String, List<RowRecord>>> uniqueLookup = new LinkedHashMap<>();
 
         for (int i = 1; i < lines.size(); i++) {
             List<String> row = parseCsvLine(lines.get(i));
@@ -124,6 +124,7 @@ public class EligibilityOracle {
                 rowMap.put(key, value);
             }
 
+            String id = rowMap.getOrDefault(result.idField, "row-" + i);
             List<String> reasons = new ArrayList<>();
             for (String required : rules.requiredFields) {
                 String value = rowMap.getOrDefault(required, "");
@@ -198,17 +199,44 @@ public class EligibilityOracle {
                 }
             }
 
-            String id = rowMap.getOrDefault(result.idField, "row-" + i);
-            if (reasons.isEmpty()) {
+            RowRecord record = new RowRecord(id, reasons);
+            rows.add(record);
+
+            for (String uniqueField : rules.uniqueFields) {
+                String value = rowMap.getOrDefault(uniqueField, "").trim();
+                if (value.isBlank()) {
+                    continue;
+                }
+                uniqueLookup
+                        .computeIfAbsent(uniqueField, key -> new LinkedHashMap<>())
+                        .computeIfAbsent(value, key -> new ArrayList<>())
+                        .add(record);
+            }
+        }
+
+        for (Map.Entry<String, Map<String, List<RowRecord>>> fieldEntry : uniqueLookup.entrySet()) {
+            String field = fieldEntry.getKey();
+            for (Map.Entry<String, List<RowRecord>> valueEntry : fieldEntry.getValue().entrySet()) {
+                List<RowRecord> matches = valueEntry.getValue();
+                if (matches.size() > 1) {
+                    for (RowRecord record : matches) {
+                        record.reasons.add("duplicate:" + field);
+                    }
+                }
+            }
+        }
+
+        for (RowRecord record : rows) {
+            if (record.reasons.isEmpty()) {
                 result.eligible++;
             } else {
                 result.ineligible++;
                 if (result.failureLimit < 0 || result.failures.size() < result.failureLimit) {
-                    result.failures.add(new FailureRecord(id, reasons));
+                    result.failures.add(new FailureRecord(record.id, record.reasons));
                 } else {
                     result.failuresTruncated = true;
                 }
-                for (String reason : reasons) {
+                for (String reason : record.reasons) {
                     result.reasonCounts.put(reason, result.reasonCounts.getOrDefault(reason, 0) + 1);
                     String category = reason.split(":", 2)[0];
                     result.reasonCategoryCounts.put(category, result.reasonCategoryCounts.getOrDefault(category, 0) + 1);
@@ -254,6 +282,15 @@ public class EligibilityOracle {
     private static String renderText(AuditResult result) {
         StringBuilder sb = new StringBuilder();
         sb.append("Eligibility Audit Summary\n");
+        if (!result.runName.isBlank()) {
+            sb.append("Run name: ").append(result.runName).append("\n");
+        }
+        if (!result.inputPath.isBlank()) {
+            sb.append("Input: ").append(result.inputPath).append("\n");
+        }
+        if (!result.rulesPath.isBlank()) {
+            sb.append("Rules: ").append(result.rulesPath).append("\n");
+        }
         sb.append("Total applicants: ").append(result.totalRows).append("\n");
         sb.append("Eligible: ").append(result.eligible).append(" (").append(formatRate(result.eligible, result.totalRows)).append(")\n");
         sb.append("Ineligible: ").append(result.ineligible).append(" (").append(formatRate(result.ineligible, result.totalRows)).append(")\n\n");
@@ -301,6 +338,9 @@ public class EligibilityOracle {
     private static String renderJson(AuditResult result) {
         StringBuilder sb = new StringBuilder();
         sb.append("{\n");
+        sb.append("  \"runName\": ").append(result.runName.isBlank() ? "null" : "\"" + escapeJson(result.runName) + "\"").append(",\n");
+        sb.append("  \"inputPath\": ").append(result.inputPath.isBlank() ? "null" : "\"" + escapeJson(result.inputPath) + "\"").append(",\n");
+        sb.append("  \"rulesPath\": ").append(result.rulesPath.isBlank() ? "null" : "\"" + escapeJson(result.rulesPath) + "\"").append(",\n");
         sb.append("  \"totalApplicants\": ").append(result.totalRows).append(",\n");
         sb.append("  \"eligible\": ").append(result.eligible).append(",\n");
         sb.append("  \"eligibleRate\": ").append(formatRateValue(result.eligible, result.totalRows)).append(",\n");
@@ -523,6 +563,9 @@ public class EligibilityOracle {
         int failureLimit = -1;
         boolean failuresTruncated = false;
         String idField = "id";
+        String runName = "";
+        String inputPath = "";
+        String rulesPath = "";
     }
 
     private static class DbConfig {
@@ -549,6 +592,16 @@ public class EligibilityOracle {
         List<String> reasons;
 
         FailureRecord(String id, List<String> reasons) {
+            this.id = id;
+            this.reasons = reasons;
+        }
+    }
+
+    private static class RowRecord {
+        String id;
+        List<String> reasons;
+
+        RowRecord(String id, List<String> reasons) {
             this.id = id;
             this.reasons = reasons;
         }
@@ -581,6 +634,7 @@ public class EligibilityOracle {
         Map<String, Set<String>> allowedValues = new LinkedHashMap<>();
         Map<String, DateRange> dateRanges = new LinkedHashMap<>();
         Map<String, Pattern> patternRules = new LinkedHashMap<>();
+        List<String> uniqueFields = new ArrayList<>();
 
         static RuleSet load(Path path) throws IOException {
             RuleSet rules = new RuleSet();
@@ -660,10 +714,15 @@ public class EligibilityOracle {
                             throw new IOException("Invalid regex for pattern:" + field + " -> " + e.getMessage(), e);
                         }
                     }
+                } else if (section.equals("unique")) {
+                    if (key.equals("fields")) {
+                        rules.uniqueFields = normalizeList(value);
+                    }
                 }
             }
             rules.conditionalRequirements.addAll(conditionalLookup.values());
             rules.requiredFields.replaceAll(EligibilityOracle::normalize);
+            rules.uniqueFields.replaceAll(EligibilityOracle::normalize);
             return rules;
         }
 

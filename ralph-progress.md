@@ -18,3 +18,8 @@
 ## Iteration 33
 - Added regex pattern rules (e.g., email validation) to eligibility audits.
 - Updated sample rules/data and README documentation for pattern checks.
+
+## Iteration 46
+- Added unique-field validation to flag duplicates like shared emails.
+- Updated sample rules and intake data to demonstrate duplicate detection.
+- Documented the new unique rule in the README feature list and rule format.

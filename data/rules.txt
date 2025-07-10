@@ -23,3 +23,6 @@ latest=2008-12-31
 
 [pattern:email]
 regex=^.+@.+\..+$
+
+[unique]
+fields=email
