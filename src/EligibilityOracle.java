@@ -145,6 +145,20 @@ public class EligibilityOracle {
                 }
             }
 
+            for (AnyRequirement requirement : rules.anyRequirements) {
+                boolean hasAny = false;
+                for (String field : requirement.fields) {
+                    String value = rowMap.getOrDefault(field, "");
+                    if (!value.isBlank()) {
+                        hasAny = true;
+                        break;
+                    }
+                }
+                if (!hasAny) {
+                    reasons.add("missing_any:" + requirement.name);
+                }
+            }
+
             for (Map.Entry<String, NumericRange> entry : rules.numericRanges.entrySet()) {
                 String field = entry.getKey();
                 String value = rowMap.getOrDefault(field, "");
@@ -630,6 +644,7 @@ public class EligibilityOracle {
     private static class RuleSet {
         List<String> requiredFields = new ArrayList<>();
         List<ConditionalRequirement> conditionalRequirements = new ArrayList<>();
+        List<AnyRequirement> anyRequirements = new ArrayList<>();
         Map<String, NumericRange> numericRanges = new LinkedHashMap<>();
         Map<String, Set<String>> allowedValues = new LinkedHashMap<>();
         Map<String, DateRange> dateRanges = new LinkedHashMap<>();
@@ -641,6 +656,7 @@ public class EligibilityOracle {
             List<String> lines = Files.readAllLines(path, StandardCharsets.UTF_8);
             String section = "";
             Map<String, ConditionalRequirement> conditionalLookup = new LinkedHashMap<>();
+            Map<String, AnyRequirement> anyLookup = new LinkedHashMap<>();
             for (String raw : lines) {
                 String line = raw.trim();
                 if (line.isEmpty() || line.startsWith("#")) {
@@ -675,6 +691,16 @@ public class EligibilityOracle {
                             }
                             requirement.requiredFields.addAll(normalizeList(value));
                         }
+                    }
+                } else if (section.startsWith("require_any:")) {
+                    if (key.equals("fields")) {
+                        String name = normalizeValue(section.substring("require_any:".length()));
+                        AnyRequirement requirement = anyLookup.get(name);
+                        if (requirement == null) {
+                            requirement = new AnyRequirement(name);
+                            anyLookup.put(name, requirement);
+                        }
+                        requirement.fields.addAll(normalizeList(value));
                     }
                 } else if (section.startsWith("range:")) {
                     String field = section.substring("range:".length());
@@ -721,8 +747,12 @@ public class EligibilityOracle {
                 }
             }
             rules.conditionalRequirements.addAll(conditionalLookup.values());
+            rules.anyRequirements.addAll(anyLookup.values());
             rules.requiredFields.replaceAll(EligibilityOracle::normalize);
             rules.uniqueFields.replaceAll(EligibilityOracle::normalize);
+            for (AnyRequirement requirement : rules.anyRequirements) {
+                requirement.fields.replaceAll(EligibilityOracle::normalize);
+            }
             return rules;
         }
 
@@ -747,6 +777,15 @@ public class EligibilityOracle {
         ConditionalRequirement(String conditionField, String conditionValue) {
             this.conditionField = conditionField;
             this.conditionValue = conditionValue;
+        }
+    }
+
+    private static class AnyRequirement {
+        String name;
+        List<String> fields = new ArrayList<>();
+
+        AnyRequirement(String name) {
+            this.name = name;
         }
     }
 

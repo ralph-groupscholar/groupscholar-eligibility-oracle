@@ -1,5 +1,14 @@
 # Ralph Progress Log
 
+## Iteration 40
+- Added require-any rule groups to flag applicants missing all fields in a contact bundle.
+- Expanded sample rules/intake data and documented the new rule option in the README.
+
+## Iteration 30 (2026-02-08)
+- Added run metadata (run name, input path, rules path) to text and JSON outputs.
+- Confirmed production seed data exists for Postgres logging.
+- Verified CLI output with the new run metadata fields.
+
 ## Iteration 39
 - Added optional Postgres logging for audit runs, reasons, and failure details.
 - Included JDBC driver + updated runner to load the lib classpath.

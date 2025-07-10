@@ -1,6 +1,6 @@
-id,first_name,last_name,email,gpa,grad_year,status,dob
-A-1001,Jordan,Lee,jordan.lee@example.com,3.6,2026,eligible,2004-03-12
-A-1002,Samira,Ortiz,samira.ortiz@invalid,2.3,2025,eligible,2003-11-20
-A-1003,Cam,Nguyen,,3.1,2027,conditional,2007-07-01
-A-1004,Alexis,Patel,alexis.patel@example.com,3.9,2032,eligible,2002-09-04
-A-1005,Quinn,Ramos,jordan.lee@example.com,3.2,2025,pending,2000-05-14
+id,first_name,last_name,email,phone,guardian_email,gpa,grad_year,status,dob,review_notes
+A-1001,Jordan,Lee,jordan.lee@example.com,555-0101,,3.6,2026,eligible,2004-03-12,
+A-1002,Samira,Ortiz,samira.ortiz@invalid,,guardian.ortiz@example.com,2.3,2025,eligible,2003-11-20,
+A-1003,Cam,Nguyen,,,3.1,2027,conditional,2007-07-01,Transcript pending
+A-1004,Alexis,Patel,alexis.patel@example.com,555-0104,,3.9,2032,eligible,2002-09-04,
+A-1005,Quinn,Ramos,jordan.lee@example.com,,guardian.ramos@example.com,3.2,2025,pending,2000-05-14,
