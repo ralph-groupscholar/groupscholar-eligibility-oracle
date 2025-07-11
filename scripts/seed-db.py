@@ -69,10 +69,34 @@ def main():
     )
     cur.execute(
         f"""
+        CREATE TABLE IF NOT EXISTS {schema}.audit_field_completeness (
+            run_id BIGINT REFERENCES {schema}.audit_runs(id) ON DELETE CASCADE,
+            field_name TEXT NOT NULL,
+            missing_count INT NOT NULL,
+            missing_rate NUMERIC(6,4) NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        f"""
         CREATE TABLE IF NOT EXISTS {schema}.audit_failures (
             run_id BIGINT REFERENCES {schema}.audit_runs(id) ON DELETE CASCADE,
             applicant_id TEXT NOT NULL,
             reasons TEXT[] NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {schema}.audit_segments (
+            run_id BIGINT REFERENCES {schema}.audit_runs(id) ON DELETE CASCADE,
+            segment_field TEXT NOT NULL,
+            segment_value TEXT NOT NULL,
+            total INT NOT NULL,
+            eligible INT NOT NULL,
+            ineligible INT NOT NULL,
+            eligible_rate NUMERIC(6,4) NOT NULL,
+            ineligible_rate NUMERIC(6,4) NOT NULL
         )
         """
     )
@@ -83,9 +107,61 @@ def main():
     )
     existing = cur.fetchone()
     if existing:
+        run_id = existing[0]
+        cur.execute(
+            f"SELECT 1 FROM {schema}.audit_field_completeness WHERE run_id = %s LIMIT 1",
+            (run_id,),
+        )
+        completeness_exists = cur.fetchone() is not None
+        cur.execute(
+            f"SELECT 1 FROM {schema}.audit_segments WHERE run_id = %s LIMIT 1",
+            (run_id,),
+        )
+        segments_exists = cur.fetchone() is not None
+        if completeness_exists and segments_exists:
+            conn.commit()
+            conn.close()
+            print("Seed already present.")
+            return 0
+        if not completeness_exists:
+            completeness_rows = [
+                ("email", 2, 0.1667),
+                ("phone", 5, 0.4167),
+                ("guardian_email", 7, 0.5833),
+                ("review_notes", 3, 0.2500),
+            ]
+            for field_name, missing_count, missing_rate in completeness_rows:
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.audit_field_completeness
+                    (run_id, field_name, missing_count, missing_rate)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (run_id, field_name, missing_count, missing_rate),
+                )
+        if not segments_exists:
+            segments = [
+                ("status", "eligible", 6, 6, 0, 1.0000, 0.0000),
+                ("status", "conditional", 4, 2, 2, 0.5000, 0.5000),
+                ("status", "ineligible", 2, 0, 2, 0.0000, 1.0000),
+            ]
+            for segment in segments:
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.audit_segments
+                    (run_id, segment_field, segment_value, total, eligible, ineligible, eligible_rate, ineligible_rate)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (run_id, *segment),
+                )
         conn.commit()
         conn.close()
-        print("Seed already present.")
+        if completeness_exists:
+            print("Seed segments inserted.")
+        elif segments_exists:
+            print("Seed field completeness inserted.")
+        else:
+            print("Seed segments and field completeness inserted.")
         return 0
 
     cur.execute(
@@ -134,6 +210,22 @@ def main():
             (run_id, category, count),
         )
 
+    completeness_rows = [
+        ("email", 2, 0.1667),
+        ("phone", 5, 0.4167),
+        ("guardian_email", 7, 0.5833),
+        ("review_notes", 3, 0.2500),
+    ]
+    for field_name, missing_count, missing_rate in completeness_rows:
+        cur.execute(
+            f"""
+            INSERT INTO {schema}.audit_field_completeness
+            (run_id, field_name, missing_count, missing_rate)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (run_id, field_name, missing_count, missing_rate),
+        )
+
     failures = [
         ("GS-1003", ["missing:email"]),
         ("GS-1006", ["out_of_range:gpa"]),
@@ -144,6 +236,21 @@ def main():
         cur.execute(
             f"INSERT INTO {schema}.audit_failures (run_id, applicant_id, reasons) VALUES (%s, %s, %s)",
             (run_id, applicant_id, reasons),
+        )
+
+    segments = [
+        ("status", "eligible", 6, 6, 0, 1.0000, 0.0000),
+        ("status", "conditional", 4, 2, 2, 0.5000, 0.5000),
+        ("status", "ineligible", 2, 0, 2, 0.0000, 1.0000),
+    ]
+    for segment in segments:
+        cur.execute(
+            f"""
+            INSERT INTO {schema}.audit_segments
+            (run_id, segment_field, segment_value, total, eligible, ineligible, eligible_rate, ineligible_rate)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (run_id, *segment),
         )
 
     conn.commit()

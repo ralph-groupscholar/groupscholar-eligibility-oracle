@@ -5,9 +5,12 @@ Eligibility Oracle is a lightweight Java CLI that audits applicant intake CSVs a
 ## Features
 - Parses CSV intakes without external dependencies
 - Rules file supports required fields, numeric ranges, allowed values, and date windows
+- Blocks explicitly disallowed values for fields like review notes or flags
 - Supports "require any" groups to ensure at least one field is present
 - Supports regex pattern validation for fields like email or IDs
 - Flags duplicate values for fields that must be unique (ex: email)
+- Supports field aliases to map intake header variants to canonical rule fields
+- Adds optional segment breakdowns to show eligibility rates by a chosen field
 - Outputs concise text summaries or JSON for downstream workflows
 - Supports custom applicant ID fields and optional failure list limits
 - Includes sample data and rules for fast iteration
@@ -26,9 +29,14 @@ Eligibility Oracle is a lightweight Java CLI that audits applicant intake CSVs a
 ./scripts/run.sh --input data/sample-intake.csv --rules data/rules.txt --id-field applicant_id --limit 25
 ```
 
+```bash
+./scripts/run.sh --input data/sample-intake.csv --rules data/rules.txt --segment-field status
+```
+
 ## Database logging (optional)
 
 The Oracle can log audit summaries to Postgres for dashboards or longitudinal tracking.
+Field completeness counts are stored alongside reason metrics for intake quality monitoring.
 
 ```bash
 export ELIGIBILITY_DB_URL="jdbc:postgresql://db-acupinir.groupscholar.com:23947/postgres?sslmode=require"
@@ -70,6 +78,9 @@ max=2030
 [allowed:status]
 values=eligible,conditional
 
+[disallowed:review_notes]
+values=unknown,tbd
+
 [date:dob]
 earliest=1998-01-01
 latest=2008-12-31
@@ -79,6 +90,12 @@ regex=^.+@.+\..+$
 
 [unique]
 fields=email
+
+[aliases]
+id=applicant_id,student_id
+grad_year=graduation_year
+guardian_email=parent_email,guardian_email_address
+review_notes=review_note,notes
 ```
 
 ## Tech

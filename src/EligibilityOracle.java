@@ -41,12 +41,13 @@ public class EligibilityOracle {
         String outputPath = options.get("output");
         boolean logDb = options.containsKey("log-db");
         String runName = options.get("run-name");
+        String segmentField = options.get("segment-field");
 
         try {
             RuleSet rules = RuleSet.load(rulesPath);
             String idField = options.getOrDefault("id-field", "id");
             int limit = parseIntOption(options.get("limit"), -1);
-            AuditResult result = audit(inputPath, rules, idField, limit);
+            AuditResult result = audit(inputPath, rules, idField, limit, segmentField);
             result.runName = runName == null ? "" : runName;
             result.inputPath = inputPath.toString();
             result.rulesPath = rulesPath.toString();
@@ -67,7 +68,7 @@ public class EligibilityOracle {
 
     private static void printUsage() {
         System.out.println("Group Scholar Eligibility Oracle");
-        System.out.println("Usage: java -cp src EligibilityOracle --input <file.csv> --rules <rules.txt> [--format text|json] [--output report.txt] [--id-field field] [--limit N] [--log-db] [--run-name name]");
+        System.out.println("Usage: java -cp src EligibilityOracle --input <file.csv> --rules <rules.txt> [--format text|json] [--output report.txt] [--id-field field] [--limit N] [--segment-field field] [--log-db] [--run-name name]");
         System.out.println("Options:");
         System.out.println("  --input   Path to applicant intake CSV");
         System.out.println("  --rules   Path to eligibility rules file");
@@ -75,6 +76,7 @@ public class EligibilityOracle {
         System.out.println("  --output  Optional output file path");
         System.out.println("  --id-field Field name to use for applicant identifiers (default: id)");
         System.out.println("  --limit   Limit number of ineligible applicants listed (default: no limit)");
+        System.out.println("  --segment-field Field to summarize eligibility breakdowns (ex: status)");
         System.out.println("  --log-db  Write audit summary + failures to the Postgres analytics schema");
         System.out.println("  --run-name Optional label to store alongside the audit run");
     }
@@ -100,7 +102,7 @@ public class EligibilityOracle {
         return options;
     }
 
-    private static AuditResult audit(Path inputPath, RuleSet rules, String idField, int limit) throws IOException {
+    private static AuditResult audit(Path inputPath, RuleSet rules, String idField, int limit, String segmentField) throws IOException {
         List<String> lines = Files.readAllLines(inputPath, StandardCharsets.UTF_8);
         if (lines.isEmpty()) {
             throw new IOException("Input CSV is empty.");
@@ -111,9 +113,14 @@ public class EligibilityOracle {
         AuditResult result = new AuditResult();
         result.totalRows = Math.max(0, lines.size() - 1);
         result.failureLimit = limit;
-        result.idField = normalize(idField);
+        result.idField = canonicalizeField(normalize(idField), rules);
+        result.segmentField = segmentField == null ? "" : canonicalizeField(normalize(segmentField), rules);
         List<RowRecord> rows = new ArrayList<>();
         Map<String, Map<String, List<RowRecord>>> uniqueLookup = new LinkedHashMap<>();
+        List<String> trackedFields = buildTrackedFields(rules);
+        for (String field : trackedFields) {
+            result.missingFieldCounts.put(field, 0);
+        }
 
         for (int i = 1; i < lines.size(); i++) {
             List<String> row = parseCsvLine(lines.get(i));
@@ -122,6 +129,13 @@ public class EligibilityOracle {
                 String key = normalize(headers.get(c));
                 String value = c < row.size() ? row.get(c).trim() : "";
                 rowMap.put(key, value);
+            }
+            applyAliases(rowMap, rules);
+            for (String field : trackedFields) {
+                String value = rowMap.getOrDefault(field, "");
+                if (value.isBlank()) {
+                    result.missingFieldCounts.put(field, result.missingFieldCounts.get(field) + 1);
+                }
             }
 
             String id = rowMap.getOrDefault(result.idField, "row-" + i);
@@ -186,6 +200,17 @@ public class EligibilityOracle {
                 }
             }
 
+            for (Map.Entry<String, Set<String>> entry : rules.disallowedValues.entrySet()) {
+                String field = entry.getKey();
+                String value = rowMap.getOrDefault(field, "");
+                if (value.isBlank()) {
+                    continue;
+                }
+                if (entry.getValue().contains(value.toLowerCase(Locale.ROOT))) {
+                    reasons.add("blocked:" + field);
+                }
+            }
+
             for (Map.Entry<String, DateRange> entry : rules.dateRanges.entrySet()) {
                 String field = entry.getKey();
                 String value = rowMap.getOrDefault(field, "");
@@ -215,6 +240,18 @@ public class EligibilityOracle {
 
             RowRecord record = new RowRecord(id, reasons);
             rows.add(record);
+
+            if (!result.segmentField.isBlank()) {
+                String rawSegmentValue = rowMap.getOrDefault(result.segmentField, "").trim();
+                String segmentValue = rawSegmentValue.isBlank() ? "missing" : normalizeValue(rawSegmentValue);
+                SegmentStats stats = result.segmentStats.computeIfAbsent(segmentValue, key -> new SegmentStats(segmentValue));
+                stats.total++;
+                if (reasons.isEmpty()) {
+                    stats.eligible++;
+                } else {
+                    stats.ineligible++;
+                }
+            }
 
             for (String uniqueField : rules.uniqueFields) {
                 String value = rowMap.getOrDefault(uniqueField, "").trim();
@@ -259,6 +296,34 @@ public class EligibilityOracle {
         }
 
         return result;
+    }
+
+    private static void applyAliases(Map<String, String> rowMap, RuleSet rules) {
+        if (rules.aliases.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<String, List<String>> entry : rules.aliases.entrySet()) {
+            String canonical = entry.getKey();
+            String current = rowMap.getOrDefault(canonical, "");
+            if (!current.isBlank()) {
+                continue;
+            }
+            for (String alias : entry.getValue()) {
+                String value = rowMap.getOrDefault(alias, "");
+                if (!value.isBlank()) {
+                    rowMap.put(canonical, value);
+                    break;
+                }
+            }
+        }
+    }
+
+    private static String canonicalizeField(String field, RuleSet rules) {
+        if (field == null || field.isBlank()) {
+            return field;
+        }
+        String canonical = rules.aliasToCanonical.get(field);
+        return canonical == null ? field : canonical;
     }
 
     private static List<String> parseCsvLine(String line) {
@@ -327,6 +392,36 @@ public class EligibilityOracle {
             sb.append("\n");
         }
 
+        if (!result.missingFieldCounts.isEmpty()) {
+            List<Map.Entry<String, Integer>> missingEntries = result.missingFieldCounts.entrySet().stream()
+                    .filter(entry -> entry.getValue() > 0)
+                    .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+                    .toList();
+            if (!missingEntries.isEmpty()) {
+                sb.append("Field completeness (missing values):\n");
+                for (Map.Entry<String, Integer> entry : missingEntries) {
+                    sb.append("- ").append(entry.getKey())
+                            .append(": ").append(entry.getValue())
+                            .append(" (").append(formatRate(entry.getValue(), result.totalRows)).append(")\n");
+                }
+                sb.append("\n");
+            }
+        }
+
+        if (!result.segmentField.isBlank() && !result.segmentStats.isEmpty()) {
+            sb.append("Segment breakdown (field: ").append(result.segmentField).append("):\n");
+            result.segmentStats.values().stream()
+                    .sorted((a, b) -> Integer.compare(b.total, a.total))
+                    .forEach(stat -> sb.append("- ").append(stat.value)
+                            .append(": total ").append(stat.total)
+                            .append(" | eligible ").append(stat.eligible)
+                            .append(" (").append(formatRate(stat.eligible, stat.total)).append(")")
+                            .append(" | ineligible ").append(stat.ineligible)
+                            .append(" (").append(formatRate(stat.ineligible, stat.total)).append(")")
+                            .append("\n"));
+            sb.append("\n");
+        }
+
         if (!result.failures.isEmpty()) {
             sb.append("Ineligible applicants:");
             if (result.failureLimit >= 0) {
@@ -363,6 +458,7 @@ public class EligibilityOracle {
         sb.append("  \"idField\": \"").append(escapeJson(result.idField)).append("\",\n");
         sb.append("  \"failureLimit\": ").append(result.failureLimit).append(",\n");
         sb.append("  \"failuresTruncated\": ").append(result.failuresTruncated).append(",\n");
+        sb.append("  \"segmentField\": ").append(result.segmentField.isBlank() ? "null" : "\"" + escapeJson(result.segmentField) + "\"").append(",\n");
         sb.append("  \"reasonCategories\": {");
         if (!result.reasonCategoryCounts.isEmpty()) {
             sb.append("\n");
@@ -387,6 +483,31 @@ public class EligibilityOracle {
             sb.append("  ");
         }
         sb.append("},\n");
+        sb.append("  \"missingFieldCounts\": {");
+        if (!result.missingFieldCounts.isEmpty()) {
+            sb.append("\n");
+            int idx = 0;
+            for (Map.Entry<String, Integer> entry : result.missingFieldCounts.entrySet()) {
+                sb.append("    \"").append(escapeJson(entry.getKey())).append("\": ").append(entry.getValue());
+                idx++;
+                sb.append(idx < result.missingFieldCounts.size() ? ",\n" : "\n");
+            }
+            sb.append("  ");
+        }
+        sb.append("},\n");
+        sb.append("  \"missingFieldRates\": {");
+        if (!result.missingFieldCounts.isEmpty()) {
+            sb.append("\n");
+            int idx = 0;
+            for (Map.Entry<String, Integer> entry : result.missingFieldCounts.entrySet()) {
+                sb.append("    \"").append(escapeJson(entry.getKey())).append("\": ")
+                        .append(formatRateValue(entry.getValue(), result.totalRows));
+                idx++;
+                sb.append(idx < result.missingFieldCounts.size() ? ",\n" : "\n");
+            }
+            sb.append("  ");
+        }
+        sb.append("},\n");
         sb.append("  \"failures\": [");
         if (!result.failures.isEmpty()) {
             sb.append("\n");
@@ -401,6 +522,24 @@ public class EligibilityOracle {
                 }
                 sb.append("]}");
                 sb.append(i + 1 < result.failures.size() ? ",\n" : "\n");
+            }
+            sb.append("  ");
+        }
+        sb.append("],\n");
+        sb.append("  \"segments\": [");
+        if (!result.segmentStats.isEmpty()) {
+            sb.append("\n");
+            List<SegmentStats> stats = new ArrayList<>(result.segmentStats.values());
+            stats.sort((a, b) -> Integer.compare(b.total, a.total));
+            for (int i = 0; i < stats.size(); i++) {
+                SegmentStats stat = stats.get(i);
+                sb.append("    {\"value\": \"").append(escapeJson(stat.value)).append("\",")
+                        .append(" \"total\": ").append(stat.total).append(",")
+                        .append(" \"eligible\": ").append(stat.eligible).append(",")
+                        .append(" \"eligibleRate\": ").append(formatRateValue(stat.eligible, stat.total)).append(",")
+                        .append(" \"ineligible\": ").append(stat.ineligible).append(",")
+                        .append(" \"ineligibleRate\": ").append(formatRateValue(stat.ineligible, stat.total)).append("}");
+                sb.append(i + 1 < stats.size() ? ",\n" : "\n");
             }
             sb.append("  ");
         }
@@ -430,7 +569,9 @@ public class EligibilityOracle {
             long runId = insertAuditRun(conn, config.schema, result, inputPath, rulesPath, runName);
             insertReasonCounts(conn, config.schema, runId, result.reasonCounts, "audit_reason_counts", "reason");
             insertReasonCounts(conn, config.schema, runId, result.reasonCategoryCounts, "audit_reason_categories", "category");
+            insertFieldCompleteness(conn, config.schema, runId, result);
             insertFailures(conn, config.schema, runId, result.failures);
+            insertSegments(conn, config.schema, runId, result);
             conn.commit();
             System.err.println("Logged audit to DB (run_id=" + runId + ").");
         } catch (SQLException e) {
@@ -467,10 +608,26 @@ public class EligibilityOracle {
                 "category TEXT NOT NULL," +
                 "count INT NOT NULL" +
                 ")";
+        String completenessSql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_field_completeness (" +
+                "run_id BIGINT REFERENCES " + schema + ".audit_runs(id) ON DELETE CASCADE," +
+                "field_name TEXT NOT NULL," +
+                "missing_count INT NOT NULL," +
+                "missing_rate NUMERIC(6,4) NOT NULL" +
+                ")";
         String failureSql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_failures (" +
                 "run_id BIGINT REFERENCES " + schema + ".audit_runs(id) ON DELETE CASCADE," +
                 "applicant_id TEXT NOT NULL," +
                 "reasons TEXT[] NOT NULL" +
+                ")";
+        String segmentSql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_segments (" +
+                "run_id BIGINT REFERENCES " + schema + ".audit_runs(id) ON DELETE CASCADE," +
+                "segment_field TEXT NOT NULL," +
+                "segment_value TEXT NOT NULL," +
+                "total INT NOT NULL," +
+                "eligible INT NOT NULL," +
+                "ineligible INT NOT NULL," +
+                "eligible_rate NUMERIC(6,4) NOT NULL," +
+                "ineligible_rate NUMERIC(6,4) NOT NULL" +
                 ")";
         try (PreparedStatement stmt = conn.prepareStatement(runsSql)) {
             stmt.execute();
@@ -481,7 +638,13 @@ public class EligibilityOracle {
         try (PreparedStatement stmt = conn.prepareStatement(categorySql)) {
             stmt.execute();
         }
+        try (PreparedStatement stmt = conn.prepareStatement(completenessSql)) {
+            stmt.execute();
+        }
         try (PreparedStatement stmt = conn.prepareStatement(failureSql)) {
+            stmt.execute();
+        }
+        try (PreparedStatement stmt = conn.prepareStatement(segmentSql)) {
             stmt.execute();
         }
     }
@@ -534,6 +697,24 @@ public class EligibilityOracle {
         }
     }
 
+    private static void insertFieldCompleteness(Connection conn, String schema, long runId, AuditResult result) throws SQLException {
+        if (result.missingFieldCounts.isEmpty()) {
+            return;
+        }
+        String sql = "INSERT INTO " + schema + ".audit_field_completeness (run_id, field_name, missing_count, missing_rate) VALUES (?, ?, ?, ?)";
+        try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+            for (Map.Entry<String, Integer> entry : result.missingFieldCounts.entrySet()) {
+                stmt.setLong(1, runId);
+                stmt.setString(2, entry.getKey());
+                stmt.setInt(3, entry.getValue());
+                double missingRate = result.totalRows == 0 ? 0.0 : (entry.getValue() * 1.0) / result.totalRows;
+                stmt.setBigDecimal(4, java.math.BigDecimal.valueOf(missingRate));
+                stmt.addBatch();
+            }
+            stmt.executeBatch();
+        }
+    }
+
     private static void insertFailures(Connection conn, String schema, long runId, List<FailureRecord> failures) throws SQLException {
         if (failures.isEmpty()) {
             return;
@@ -545,6 +726,31 @@ public class EligibilityOracle {
                 stmt.setString(2, record.id);
                 Array reasonArray = conn.createArrayOf("text", record.reasons.toArray());
                 stmt.setArray(3, reasonArray);
+                stmt.addBatch();
+            }
+            stmt.executeBatch();
+        }
+    }
+
+    private static void insertSegments(Connection conn, String schema, long runId, AuditResult result) throws SQLException {
+        if (result.segmentField.isBlank() || result.segmentStats.isEmpty()) {
+            return;
+        }
+        String sql = "INSERT INTO " + schema + ".audit_segments " +
+                "(run_id, segment_field, segment_value, total, eligible, ineligible, eligible_rate, ineligible_rate) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+            for (SegmentStats stat : result.segmentStats.values()) {
+                double eligibleRate = stat.total == 0 ? 0.0 : (stat.eligible * 1.0) / stat.total;
+                double ineligibleRate = stat.total == 0 ? 0.0 : (stat.ineligible * 1.0) / stat.total;
+                stmt.setLong(1, runId);
+                stmt.setString(2, result.segmentField);
+                stmt.setString(3, stat.value);
+                stmt.setInt(4, stat.total);
+                stmt.setInt(5, stat.eligible);
+                stmt.setInt(6, stat.ineligible);
+                stmt.setBigDecimal(7, java.math.BigDecimal.valueOf(eligibleRate));
+                stmt.setBigDecimal(8, java.math.BigDecimal.valueOf(ineligibleRate));
                 stmt.addBatch();
             }
             stmt.executeBatch();
@@ -573,6 +779,7 @@ public class EligibilityOracle {
         int ineligible = 0;
         Map<String, Integer> reasonCounts = new LinkedHashMap<>();
         Map<String, Integer> reasonCategoryCounts = new LinkedHashMap<>();
+        Map<String, Integer> missingFieldCounts = new LinkedHashMap<>();
         List<FailureRecord> failures = new ArrayList<>();
         int failureLimit = -1;
         boolean failuresTruncated = false;
@@ -580,6 +787,19 @@ public class EligibilityOracle {
         String runName = "";
         String inputPath = "";
         String rulesPath = "";
+        String segmentField = "";
+        Map<String, SegmentStats> segmentStats = new LinkedHashMap<>();
+    }
+
+    private static class SegmentStats {
+        String value;
+        int total;
+        int eligible;
+        int ineligible;
+
+        SegmentStats(String value) {
+            this.value = value;
+        }
     }
 
     private static class DbConfig {
@@ -647,9 +867,12 @@ public class EligibilityOracle {
         List<AnyRequirement> anyRequirements = new ArrayList<>();
         Map<String, NumericRange> numericRanges = new LinkedHashMap<>();
         Map<String, Set<String>> allowedValues = new LinkedHashMap<>();
+        Map<String, Set<String>> disallowedValues = new LinkedHashMap<>();
         Map<String, DateRange> dateRanges = new LinkedHashMap<>();
         Map<String, Pattern> patternRules = new LinkedHashMap<>();
         List<String> uniqueFields = new ArrayList<>();
+        Map<String, List<String>> aliases = new LinkedHashMap<>();
+        Map<String, String> aliasToCanonical = new LinkedHashMap<>();
 
         static RuleSet load(Path path) throws IOException {
             RuleSet rules = new RuleSet();
@@ -721,6 +944,15 @@ public class EligibilityOracle {
                         }
                         rules.allowedValues.put(field, values);
                     }
+                } else if (section.startsWith("disallowed:")) {
+                    String field = section.substring("disallowed:".length());
+                    if (key.equals("values")) {
+                        Set<String> values = new HashSet<>();
+                        for (String entry : normalizeList(value)) {
+                            values.add(entry.toLowerCase(Locale.ROOT));
+                        }
+                        rules.disallowedValues.put(field, values);
+                    }
                 } else if (section.startsWith("date:")) {
                     String field = section.substring("date:".length());
                     LocalDate earliest = rules.dateRanges.containsKey(field) ? rules.dateRanges.get(field).earliest : LocalDate.MIN;
@@ -743,6 +975,15 @@ public class EligibilityOracle {
                 } else if (section.equals("unique")) {
                     if (key.equals("fields")) {
                         rules.uniqueFields = normalizeList(value);
+                    }
+                } else if (section.equals("aliases")) {
+                    String canonical = normalize(key);
+                    List<String> aliasList = normalizeList(value);
+                    if (!canonical.isBlank() && !aliasList.isEmpty()) {
+                        rules.aliases.put(canonical, aliasList);
+                        for (String alias : aliasList) {
+                            rules.aliasToCanonical.put(alias, canonical);
+                        }
                     }
                 }
             }
@@ -813,6 +1054,33 @@ public class EligibilityOracle {
             return Integer.parseInt(value.trim());
         } catch (NumberFormatException e) {
             return fallback;
+        }
+    }
+
+    private static List<String> buildTrackedFields(RuleSet rules) {
+        LinkedHashMap<String, Boolean> fields = new LinkedHashMap<>();
+        addAll(fields, rules.requiredFields);
+        for (ConditionalRequirement requirement : rules.conditionalRequirements) {
+            addAll(fields, Arrays.asList(requirement.conditionField));
+            addAll(fields, requirement.requiredFields);
+        }
+        for (AnyRequirement requirement : rules.anyRequirements) {
+            addAll(fields, requirement.fields);
+        }
+        addAll(fields, rules.numericRanges.keySet());
+        addAll(fields, rules.allowedValues.keySet());
+        addAll(fields, rules.disallowedValues.keySet());
+        addAll(fields, rules.dateRanges.keySet());
+        addAll(fields, rules.patternRules.keySet());
+        addAll(fields, rules.uniqueFields);
+        return new ArrayList<>(fields.keySet());
+    }
+
+    private static void addAll(Map<String, Boolean> target, Iterable<String> values) {
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                target.put(value, Boolean.TRUE);
+            }
         }
     }
 }

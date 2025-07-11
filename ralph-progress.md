@@ -1,5 +1,25 @@
 # Ralph Progress Log
 
+## Iteration 73 (2026-02-08)
+- Added database logging for field completeness counts + missing-rate metrics.
+- Extended the production seed script to populate completeness rows and handle upgrades.
+- Documented the new completeness logging in the README.
+
+## Iteration 84 (2026-02-08)
+- Added disallowed value rules that flag blocked field values with a dedicated reason category.
+- Updated tracked field completeness to include conditional trigger fields and disallowed lists.
+- Expanded sample rules/data plus README documentation to showcase blocked value audits.
+
+## Iteration 93 (2026-02-08)
+- Added field alias support to map intake header variants onto canonical rule fields.
+- Canonicalized segment/id fields when alias definitions are present.
+- Documented alias rules and refreshed the sample rules file.
+
+## Iteration 72 (2026-02-08)
+- Added segment-field summaries for eligibility rates by a chosen CSV field.
+- Persisted segment breakdowns to Postgres with a new audit_segments table.
+- Updated README usage and production seed data to include segments.
+
 ## Iteration 40
 - Added require-any rule groups to flag applicants missing all fields in a contact bundle.
 - Expanded sample rules/intake data and documented the new rule option in the README.
