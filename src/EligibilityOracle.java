@@ -42,12 +42,13 @@ public class EligibilityOracle {
         boolean logDb = options.containsKey("log-db");
         String runName = options.get("run-name");
         String segmentField = options.get("segment-field");
+        int reviewLimit = parseIntOption(options.get("review-limit"), -1);
 
         try {
             RuleSet rules = RuleSet.load(rulesPath);
             String idField = options.getOrDefault("id-field", "id");
             int limit = parseIntOption(options.get("limit"), -1);
-            AuditResult result = audit(inputPath, rules, idField, limit, segmentField);
+            AuditResult result = audit(inputPath, rules, idField, limit, segmentField, reviewLimit);
             result.runName = runName == null ? "" : runName;
             result.inputPath = inputPath.toString();
             result.rulesPath = rulesPath.toString();
@@ -68,7 +69,7 @@ public class EligibilityOracle {
 
     private static void printUsage() {
         System.out.println("Group Scholar Eligibility Oracle");
-        System.out.println("Usage: java -cp src EligibilityOracle --input <file.csv> --rules <rules.txt> [--format text|json] [--output report.txt] [--id-field field] [--limit N] [--segment-field field] [--log-db] [--run-name name]");
+        System.out.println("Usage: java -cp src EligibilityOracle --input <file.csv> --rules <rules.txt> [--format text|json] [--output report.txt] [--id-field field] [--limit N] [--segment-field field] [--review-limit N] [--log-db] [--run-name name]");
         System.out.println("Options:");
         System.out.println("  --input   Path to applicant intake CSV");
         System.out.println("  --rules   Path to eligibility rules file");
@@ -77,6 +78,7 @@ public class EligibilityOracle {
         System.out.println("  --id-field Field name to use for applicant identifiers (default: id)");
         System.out.println("  --limit   Limit number of ineligible applicants listed (default: no limit)");
         System.out.println("  --segment-field Field to summarize eligibility breakdowns (ex: status)");
+        System.out.println("  --review-limit Limit number of review-flagged applicants listed (default: no limit)");
         System.out.println("  --log-db  Write audit summary + failures to the Postgres analytics schema");
         System.out.println("  --run-name Optional label to store alongside the audit run");
     }
@@ -102,7 +104,7 @@ public class EligibilityOracle {
         return options;
     }
 
-    private static AuditResult audit(Path inputPath, RuleSet rules, String idField, int limit, String segmentField) throws IOException {
+    private static AuditResult audit(Path inputPath, RuleSet rules, String idField, int limit, String segmentField, int reviewLimit) throws IOException {
         List<String> lines = Files.readAllLines(inputPath, StandardCharsets.UTF_8);
         if (lines.isEmpty()) {
             throw new IOException("Input CSV is empty.");
@@ -113,6 +115,7 @@ public class EligibilityOracle {
         AuditResult result = new AuditResult();
         result.totalRows = Math.max(0, lines.size() - 1);
         result.failureLimit = limit;
+        result.reviewLimit = reviewLimit;
         result.idField = canonicalizeField(normalize(idField), rules);
         result.segmentField = segmentField == null ? "" : canonicalizeField(normalize(segmentField), rules);
         List<RowRecord> rows = new ArrayList<>();
@@ -140,6 +143,8 @@ public class EligibilityOracle {
 
             String id = rowMap.getOrDefault(result.idField, "row-" + i);
             List<String> reasons = new ArrayList<>();
+            List<String> reviewReasons = new ArrayList<>();
+            List<String> warnings = new ArrayList<>();
             for (String required : rules.requiredFields) {
                 String value = rowMap.getOrDefault(required, "");
                 if (value.isBlank()) {
@@ -170,6 +175,22 @@ public class EligibilityOracle {
                 }
                 if (!hasAny) {
                     reasons.add("missing_any:" + requirement.name);
+                }
+            }
+
+            for (String reviewField : rules.reviewMissingFields) {
+                String value = rowMap.getOrDefault(reviewField, "");
+                if (value.isBlank()) {
+                    reviewReasons.add("review_missing:" + reviewField);
+                }
+            }
+
+            for (ReviewCondition condition : rules.reviewConditions) {
+                String value = normalizeValue(rowMap.getOrDefault(condition.conditionField, ""));
+                if (value.equals(condition.conditionValue)) {
+                    for (String reason : condition.reasons) {
+                        reviewReasons.add("review_flag:" + reason);
+                    }
                 }
             }
 
@@ -238,7 +259,105 @@ public class EligibilityOracle {
                 }
             }
 
-            RowRecord record = new RowRecord(id, reasons);
+            for (String required : rules.warnRequiredFields) {
+                String value = rowMap.getOrDefault(required, "");
+                if (value.isBlank()) {
+                    warnings.add("warn_missing:" + required);
+                }
+            }
+
+            for (ConditionalRequirement requirement : rules.warnConditionalRequirements) {
+                String value = normalizeValue(rowMap.getOrDefault(requirement.conditionField, ""));
+                if (value.equals(requirement.conditionValue)) {
+                    for (String needed : requirement.requiredFields) {
+                        String requiredValue = rowMap.getOrDefault(needed, "");
+                        if (requiredValue.isBlank()) {
+                            warnings.add("warn_missing_if:" + requirement.conditionField + "=" + requirement.conditionValue + ":" + needed);
+                        }
+                    }
+                }
+            }
+
+            for (AnyRequirement requirement : rules.warnAnyRequirements) {
+                boolean hasAny = false;
+                for (String field : requirement.fields) {
+                    String value = rowMap.getOrDefault(field, "");
+                    if (!value.isBlank()) {
+                        hasAny = true;
+                        break;
+                    }
+                }
+                if (!hasAny) {
+                    warnings.add("warn_missing_any:" + requirement.name);
+                }
+            }
+
+            for (Map.Entry<String, NumericRange> entry : rules.warnNumericRanges.entrySet()) {
+                String field = entry.getKey();
+                String value = rowMap.getOrDefault(field, "");
+                if (value.isBlank()) {
+                    continue;
+                }
+                try {
+                    double numeric = Double.parseDouble(value);
+                    if (numeric < entry.getValue().min || numeric > entry.getValue().max) {
+                        warnings.add("warn_out_of_range:" + field);
+                    }
+                } catch (NumberFormatException e) {
+                    warnings.add("warn_invalid_number:" + field);
+                }
+            }
+
+            for (Map.Entry<String, Set<String>> entry : rules.warnAllowedValues.entrySet()) {
+                String field = entry.getKey();
+                String value = rowMap.getOrDefault(field, "");
+                if (value.isBlank()) {
+                    continue;
+                }
+                if (!entry.getValue().contains(value.toLowerCase(Locale.ROOT))) {
+                    warnings.add("warn_disallowed:" + field);
+                }
+            }
+
+            for (Map.Entry<String, Set<String>> entry : rules.warnDisallowedValues.entrySet()) {
+                String field = entry.getKey();
+                String value = rowMap.getOrDefault(field, "");
+                if (value.isBlank()) {
+                    continue;
+                }
+                if (entry.getValue().contains(value.toLowerCase(Locale.ROOT))) {
+                    warnings.add("warn_blocked:" + field);
+                }
+            }
+
+            for (Map.Entry<String, DateRange> entry : rules.warnDateRanges.entrySet()) {
+                String field = entry.getKey();
+                String value = rowMap.getOrDefault(field, "");
+                if (value.isBlank()) {
+                    continue;
+                }
+                try {
+                    LocalDate date = LocalDate.parse(value);
+                    if (date.isBefore(entry.getValue().earliest) || date.isAfter(entry.getValue().latest)) {
+                        warnings.add("warn_out_of_range:" + field);
+                    }
+                } catch (DateTimeParseException e) {
+                    warnings.add("warn_invalid_date:" + field);
+                }
+            }
+
+            for (Map.Entry<String, Pattern> entry : rules.warnPatternRules.entrySet()) {
+                String field = entry.getKey();
+                String value = rowMap.getOrDefault(field, "");
+                if (value.isBlank()) {
+                    continue;
+                }
+                if (!entry.getValue().matcher(value).matches()) {
+                    warnings.add("warn_invalid_pattern:" + field);
+                }
+            }
+
+            RowRecord record = new RowRecord(id, reasons, reviewReasons, warnings);
             rows.add(record);
 
             if (!result.segmentField.isBlank()) {
@@ -291,6 +410,25 @@ public class EligibilityOracle {
                     result.reasonCounts.put(reason, result.reasonCounts.getOrDefault(reason, 0) + 1);
                     String category = reason.split(":", 2)[0];
                     result.reasonCategoryCounts.put(category, result.reasonCategoryCounts.getOrDefault(category, 0) + 1);
+                }
+            }
+            if (!record.warningReasons.isEmpty()) {
+                result.warningApplicants++;
+                for (String warning : record.warningReasons) {
+                    result.warningCounts.put(warning, result.warningCounts.getOrDefault(warning, 0) + 1);
+                    String category = warning.split(":", 2)[0];
+                    result.warningCategoryCounts.put(category, result.warningCategoryCounts.getOrDefault(category, 0) + 1);
+                }
+            }
+            if (!record.reviewReasons.isEmpty()) {
+                result.reviewCount++;
+                if (result.reviewLimit < 0 || result.reviews.size() < result.reviewLimit) {
+                    result.reviews.add(new ReviewRecord(record.id, record.reviewReasons));
+                } else {
+                    result.reviewsTruncated = true;
+                }
+                for (String reason : record.reviewReasons) {
+                    result.reviewCounts.put(reason, result.reviewCounts.getOrDefault(reason, 0) + 1);
                 }
             }
         }
@@ -373,10 +511,23 @@ public class EligibilityOracle {
         sb.append("Total applicants: ").append(result.totalRows).append("\n");
         sb.append("Eligible: ").append(result.eligible).append(" (").append(formatRate(result.eligible, result.totalRows)).append(")\n");
         sb.append("Ineligible: ").append(result.ineligible).append(" (").append(formatRate(result.ineligible, result.totalRows)).append(")\n\n");
+        if (!result.warningCounts.isEmpty()) {
+            sb.append("Applicants with warnings: ").append(result.warningApplicants)
+                    .append(" (").append(formatRate(result.warningApplicants, result.totalRows)).append(")\n\n");
+        }
 
         if (!result.reasonCategoryCounts.isEmpty()) {
             sb.append("Reason categories:\n");
             result.reasonCategoryCounts.entrySet().stream()
+                    .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+                    .forEach(entry -> sb.append("- ").append(entry.getKey())
+                            .append(": ").append(entry.getValue()).append("\n"));
+            sb.append("\n");
+        }
+
+        if (!result.warningCategoryCounts.isEmpty()) {
+            sb.append("Warning categories:\n");
+            result.warningCategoryCounts.entrySet().stream()
                     .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
                     .forEach(entry -> sb.append("- ").append(entry.getKey())
                             .append(": ").append(entry.getValue()).append("\n"));
@@ -390,6 +541,28 @@ public class EligibilityOracle {
                     .forEach(entry -> sb.append("- ").append(entry.getKey())
                             .append(": ").append(entry.getValue()).append("\n"));
             sb.append("\n");
+        }
+
+        if (!result.warningCounts.isEmpty()) {
+            sb.append("Top warnings:\n");
+            result.warningCounts.entrySet().stream()
+                    .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+                    .forEach(entry -> sb.append("- ").append(entry.getKey())
+                            .append(": ").append(entry.getValue()).append("\n"));
+            sb.append("\n");
+        }
+
+        if (result.reviewCount > 0) {
+            sb.append("Review flags: ").append(result.reviewCount)
+                    .append(" (").append(formatRate(result.reviewCount, result.totalRows)).append(")\n");
+            if (!result.reviewCounts.isEmpty()) {
+                sb.append("Top review flags:\n");
+                result.reviewCounts.entrySet().stream()
+                        .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+                        .forEach(entry -> sb.append("- ").append(entry.getKey())
+                                .append(": ").append(entry.getValue()).append("\n"));
+                sb.append("\n");
+            }
         }
 
         if (!result.missingFieldCounts.isEmpty()) {
@@ -441,6 +614,25 @@ public class EligibilityOracle {
             }
         }
 
+        if (!result.reviews.isEmpty()) {
+            sb.append("Review-flagged applicants:");
+            if (result.reviewLimit >= 0) {
+                sb.append(" (showing ").append(result.reviews.size());
+                if (result.reviewsTruncated) {
+                    sb.append(" of ").append(result.reviewCount);
+                }
+                sb.append(")");
+            }
+            sb.append("\n");
+            for (ReviewRecord record : result.reviews) {
+                sb.append("- ").append(record.id).append(": ")
+                        .append(String.join(", ", record.reasons)).append("\n");
+            }
+            if (result.reviewsTruncated) {
+                sb.append("... truncated\n");
+            }
+        }
+
         return sb.toString();
     }
 
@@ -455,9 +647,15 @@ public class EligibilityOracle {
         sb.append("  \"eligibleRate\": ").append(formatRateValue(result.eligible, result.totalRows)).append(",\n");
         sb.append("  \"ineligible\": ").append(result.ineligible).append(",\n");
         sb.append("  \"ineligibleRate\": ").append(formatRateValue(result.ineligible, result.totalRows)).append(",\n");
+        sb.append("  \"warningApplicants\": ").append(result.warningApplicants).append(",\n");
+        sb.append("  \"warningRate\": ").append(formatRateValue(result.warningApplicants, result.totalRows)).append(",\n");
         sb.append("  \"idField\": \"").append(escapeJson(result.idField)).append("\",\n");
         sb.append("  \"failureLimit\": ").append(result.failureLimit).append(",\n");
         sb.append("  \"failuresTruncated\": ").append(result.failuresTruncated).append(",\n");
+        sb.append("  \"reviewCount\": ").append(result.reviewCount).append(",\n");
+        sb.append("  \"reviewRate\": ").append(formatRateValue(result.reviewCount, result.totalRows)).append(",\n");
+        sb.append("  \"reviewLimit\": ").append(result.reviewLimit).append(",\n");
+        sb.append("  \"reviewsTruncated\": ").append(result.reviewsTruncated).append(",\n");
         sb.append("  \"segmentField\": ").append(result.segmentField.isBlank() ? "null" : "\"" + escapeJson(result.segmentField) + "\"").append(",\n");
         sb.append("  \"reasonCategories\": {");
         if (!result.reasonCategoryCounts.isEmpty()) {
@@ -471,6 +669,18 @@ public class EligibilityOracle {
             sb.append("  ");
         }
         sb.append("},\n");
+        sb.append("  \"warningCategories\": {");
+        if (!result.warningCategoryCounts.isEmpty()) {
+            sb.append("\n");
+            int catIdx = 0;
+            for (Map.Entry<String, Integer> entry : result.warningCategoryCounts.entrySet()) {
+                sb.append("    \"").append(escapeJson(entry.getKey())).append("\": ").append(entry.getValue());
+                catIdx++;
+                sb.append(catIdx < result.warningCategoryCounts.size() ? ",\n" : "\n");
+            }
+            sb.append("  ");
+        }
+        sb.append("},\n");
         sb.append("  \"reasonCounts\": {");
         if (!result.reasonCounts.isEmpty()) {
             sb.append("\n");
@@ -479,6 +689,18 @@ public class EligibilityOracle {
                 sb.append("    \"").append(escapeJson(entry.getKey())).append("\": ").append(entry.getValue());
                 idx++;
                 sb.append(idx < result.reasonCounts.size() ? ",\n" : "\n");
+            }
+            sb.append("  ");
+        }
+        sb.append("},\n");
+        sb.append("  \"warningCounts\": {");
+        if (!result.warningCounts.isEmpty()) {
+            sb.append("\n");
+            int idx = 0;
+            for (Map.Entry<String, Integer> entry : result.warningCounts.entrySet()) {
+                sb.append("    \"").append(escapeJson(entry.getKey())).append("\": ").append(entry.getValue());
+                idx++;
+                sb.append(idx < result.warningCounts.size() ? ",\n" : "\n");
             }
             sb.append("  ");
         }
@@ -526,6 +748,36 @@ public class EligibilityOracle {
             sb.append("  ");
         }
         sb.append("],\n");
+        sb.append("  \"reviewCounts\": {");
+        if (!result.reviewCounts.isEmpty()) {
+            sb.append("\n");
+            int idx = 0;
+            for (Map.Entry<String, Integer> entry : result.reviewCounts.entrySet()) {
+                sb.append("    \"").append(escapeJson(entry.getKey())).append("\": ").append(entry.getValue());
+                idx++;
+                sb.append(idx < result.reviewCounts.size() ? ",\n" : "\n");
+            }
+            sb.append("  ");
+        }
+        sb.append("},\n");
+        sb.append("  \"reviews\": [");
+        if (!result.reviews.isEmpty()) {
+            sb.append("\n");
+            for (int i = 0; i < result.reviews.size(); i++) {
+                ReviewRecord record = result.reviews.get(i);
+                sb.append("    {\"id\": \"").append(escapeJson(record.id)).append("\", \"reasons\": [");
+                for (int r = 0; r < record.reasons.size(); r++) {
+                    sb.append("\"").append(escapeJson(record.reasons.get(r))).append("\"");
+                    if (r + 1 < record.reasons.size()) {
+                        sb.append(", ");
+                    }
+                }
+                sb.append("]}");
+                sb.append(i + 1 < result.reviews.size() ? ",\n" : "\n");
+            }
+            sb.append("  ");
+        }
+        sb.append("],\n");
         sb.append("  \"segments\": [");
         if (!result.segmentStats.isEmpty()) {
             sb.append("\n");
@@ -569,6 +821,8 @@ public class EligibilityOracle {
             long runId = insertAuditRun(conn, config.schema, result, inputPath, rulesPath, runName);
             insertReasonCounts(conn, config.schema, runId, result.reasonCounts, "audit_reason_counts", "reason");
             insertReasonCounts(conn, config.schema, runId, result.reasonCategoryCounts, "audit_reason_categories", "category");
+            insertReasonCounts(conn, config.schema, runId, result.warningCounts, "audit_warning_counts", "warning");
+            insertReasonCounts(conn, config.schema, runId, result.warningCategoryCounts, "audit_warning_categories", "category");
             insertFieldCompleteness(conn, config.schema, runId, result);
             insertFailures(conn, config.schema, runId, result.failures);
             insertSegments(conn, config.schema, runId, result);
@@ -608,6 +862,16 @@ public class EligibilityOracle {
                 "category TEXT NOT NULL," +
                 "count INT NOT NULL" +
                 ")";
+        String warningSql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_warning_counts (" +
+                "run_id BIGINT REFERENCES " + schema + ".audit_runs(id) ON DELETE CASCADE," +
+                "warning TEXT NOT NULL," +
+                "count INT NOT NULL" +
+                ")";
+        String warningCategorySql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_warning_categories (" +
+                "run_id BIGINT REFERENCES " + schema + ".audit_runs(id) ON DELETE CASCADE," +
+                "category TEXT NOT NULL," +
+                "count INT NOT NULL" +
+                ")";
         String completenessSql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_field_completeness (" +
                 "run_id BIGINT REFERENCES " + schema + ".audit_runs(id) ON DELETE CASCADE," +
                 "field_name TEXT NOT NULL," +
@@ -636,6 +900,12 @@ public class EligibilityOracle {
             stmt.execute();
         }
         try (PreparedStatement stmt = conn.prepareStatement(categorySql)) {
+            stmt.execute();
+        }
+        try (PreparedStatement stmt = conn.prepareStatement(warningSql)) {
+            stmt.execute();
+        }
+        try (PreparedStatement stmt = conn.prepareStatement(warningCategorySql)) {
             stmt.execute();
         }
         try (PreparedStatement stmt = conn.prepareStatement(completenessSql)) {
@@ -777,12 +1047,20 @@ public class EligibilityOracle {
         int totalRows = 0;
         int eligible = 0;
         int ineligible = 0;
+        int warningApplicants = 0;
+        int reviewCount = 0;
         Map<String, Integer> reasonCounts = new LinkedHashMap<>();
         Map<String, Integer> reasonCategoryCounts = new LinkedHashMap<>();
+        Map<String, Integer> warningCounts = new LinkedHashMap<>();
+        Map<String, Integer> warningCategoryCounts = new LinkedHashMap<>();
         Map<String, Integer> missingFieldCounts = new LinkedHashMap<>();
+        Map<String, Integer> reviewCounts = new LinkedHashMap<>();
         List<FailureRecord> failures = new ArrayList<>();
+        List<ReviewRecord> reviews = new ArrayList<>();
         int failureLimit = -1;
         boolean failuresTruncated = false;
+        int reviewLimit = -1;
+        boolean reviewsTruncated = false;
         String idField = "id";
         String runName = "";
         String inputPath = "";
@@ -834,8 +1112,22 @@ public class EligibilityOracle {
     private static class RowRecord {
         String id;
         List<String> reasons;
+        List<String> reviewReasons;
+        List<String> warningReasons;
 
-        RowRecord(String id, List<String> reasons) {
+        RowRecord(String id, List<String> reasons, List<String> reviewReasons, List<String> warningReasons) {
+            this.id = id;
+            this.reasons = reasons;
+            this.reviewReasons = reviewReasons;
+            this.warningReasons = warningReasons;
+        }
+    }
+
+    private static class ReviewRecord {
+        String id;
+        List<String> reasons;
+
+        ReviewRecord(String id, List<String> reasons) {
             this.id = id;
             this.reasons = reasons;
         }
@@ -865,12 +1157,22 @@ public class EligibilityOracle {
         List<String> requiredFields = new ArrayList<>();
         List<ConditionalRequirement> conditionalRequirements = new ArrayList<>();
         List<AnyRequirement> anyRequirements = new ArrayList<>();
+        List<String> reviewMissingFields = new ArrayList<>();
+        List<ReviewCondition> reviewConditions = new ArrayList<>();
         Map<String, NumericRange> numericRanges = new LinkedHashMap<>();
         Map<String, Set<String>> allowedValues = new LinkedHashMap<>();
         Map<String, Set<String>> disallowedValues = new LinkedHashMap<>();
         Map<String, DateRange> dateRanges = new LinkedHashMap<>();
         Map<String, Pattern> patternRules = new LinkedHashMap<>();
         List<String> uniqueFields = new ArrayList<>();
+        List<String> warnRequiredFields = new ArrayList<>();
+        List<ConditionalRequirement> warnConditionalRequirements = new ArrayList<>();
+        List<AnyRequirement> warnAnyRequirements = new ArrayList<>();
+        Map<String, NumericRange> warnNumericRanges = new LinkedHashMap<>();
+        Map<String, Set<String>> warnAllowedValues = new LinkedHashMap<>();
+        Map<String, Set<String>> warnDisallowedValues = new LinkedHashMap<>();
+        Map<String, DateRange> warnDateRanges = new LinkedHashMap<>();
+        Map<String, Pattern> warnPatternRules = new LinkedHashMap<>();
         Map<String, List<String>> aliases = new LinkedHashMap<>();
         Map<String, String> aliasToCanonical = new LinkedHashMap<>();
 
@@ -880,6 +1182,9 @@ public class EligibilityOracle {
             String section = "";
             Map<String, ConditionalRequirement> conditionalLookup = new LinkedHashMap<>();
             Map<String, AnyRequirement> anyLookup = new LinkedHashMap<>();
+            Map<String, ConditionalRequirement> warnConditionalLookup = new LinkedHashMap<>();
+            Map<String, AnyRequirement> warnAnyLookup = new LinkedHashMap<>();
+            Map<String, ReviewCondition> reviewLookup = new LinkedHashMap<>();
             for (String raw : lines) {
                 String line = raw.trim();
                 if (line.isEmpty() || line.startsWith("#")) {
@@ -899,6 +1204,14 @@ public class EligibilityOracle {
                     if (key.equals("fields")) {
                         rules.requiredFields = normalizeList(value);
                     }
+                } else if (section.equals("review_missing")) {
+                    if (key.equals("fields")) {
+                        rules.reviewMissingFields = normalizeList(value);
+                    }
+                } else if (section.equals("warn_required")) {
+                    if (key.equals("fields")) {
+                        rules.warnRequiredFields = normalizeList(value);
+                    }
                 } else if (section.startsWith("require_if:")) {
                     if (key.equals("fields")) {
                         String condition = section.substring("require_if:".length());
@@ -915,6 +1228,38 @@ public class EligibilityOracle {
                             requirement.requiredFields.addAll(normalizeList(value));
                         }
                     }
+                } else if (section.startsWith("warn_if:")) {
+                    if (key.equals("fields")) {
+                        String condition = section.substring("warn_if:".length());
+                        String[] conditionParts = condition.split("=", 2);
+                        if (conditionParts.length == 2) {
+                            String conditionField = normalize(conditionParts[0]);
+                            String conditionValue = normalizeValue(conditionParts[1]);
+                            String conditionKey = conditionField + "=" + conditionValue;
+                            ConditionalRequirement requirement = warnConditionalLookup.get(conditionKey);
+                            if (requirement == null) {
+                                requirement = new ConditionalRequirement(conditionField, conditionValue);
+                                warnConditionalLookup.put(conditionKey, requirement);
+                            }
+                            requirement.requiredFields.addAll(normalizeList(value));
+                        }
+                    }
+                } else if (section.startsWith("review_if:")) {
+                    if (key.equals("reasons")) {
+                        String condition = section.substring("review_if:".length());
+                        String[] conditionParts = condition.split("=", 2);
+                        if (conditionParts.length == 2) {
+                            String conditionField = normalize(conditionParts[0]);
+                            String conditionValue = normalizeValue(conditionParts[1]);
+                            String conditionKey = conditionField + "=" + conditionValue;
+                            ReviewCondition requirement = reviewLookup.get(conditionKey);
+                            if (requirement == null) {
+                                requirement = new ReviewCondition(conditionField, conditionValue);
+                                reviewLookup.put(conditionKey, requirement);
+                            }
+                            requirement.reasons.addAll(normalizeList(value));
+                        }
+                    }
                 } else if (section.startsWith("require_any:")) {
                     if (key.equals("fields")) {
                         String name = normalizeValue(section.substring("require_any:".length()));
@@ -922,6 +1267,16 @@ public class EligibilityOracle {
                         if (requirement == null) {
                             requirement = new AnyRequirement(name);
                             anyLookup.put(name, requirement);
+                        }
+                        requirement.fields.addAll(normalizeList(value));
+                    }
+                } else if (section.startsWith("warn_any:")) {
+                    if (key.equals("fields")) {
+                        String name = normalizeValue(section.substring("warn_any:".length()));
+                        AnyRequirement requirement = warnAnyLookup.get(name);
+                        if (requirement == null) {
+                            requirement = new AnyRequirement(name);
+                            warnAnyLookup.put(name, requirement);
                         }
                         requirement.fields.addAll(normalizeList(value));
                     }
@@ -935,6 +1290,16 @@ public class EligibilityOracle {
                         max = Double.parseDouble(value);
                     }
                     rules.numericRanges.put(field, new NumericRange(min, max));
+                } else if (section.startsWith("warn_range:")) {
+                    String field = section.substring("warn_range:".length());
+                    double min = rules.warnNumericRanges.containsKey(field) ? rules.warnNumericRanges.get(field).min : Double.NEGATIVE_INFINITY;
+                    double max = rules.warnNumericRanges.containsKey(field) ? rules.warnNumericRanges.get(field).max : Double.POSITIVE_INFINITY;
+                    if (key.equals("min")) {
+                        min = Double.parseDouble(value);
+                    } else if (key.equals("max")) {
+                        max = Double.parseDouble(value);
+                    }
+                    rules.warnNumericRanges.put(field, new NumericRange(min, max));
                 } else if (section.startsWith("allowed:")) {
                     String field = section.substring("allowed:".length());
                     if (key.equals("values")) {
@@ -944,6 +1309,15 @@ public class EligibilityOracle {
                         }
                         rules.allowedValues.put(field, values);
                     }
+                } else if (section.startsWith("warn_allowed:")) {
+                    String field = section.substring("warn_allowed:".length());
+                    if (key.equals("values")) {
+                        Set<String> values = new HashSet<>();
+                        for (String entry : normalizeList(value)) {
+                            values.add(entry.toLowerCase(Locale.ROOT));
+                        }
+                        rules.warnAllowedValues.put(field, values);
+                    }
                 } else if (section.startsWith("disallowed:")) {
                     String field = section.substring("disallowed:".length());
                     if (key.equals("values")) {
@@ -952,6 +1326,15 @@ public class EligibilityOracle {
                             values.add(entry.toLowerCase(Locale.ROOT));
                         }
                         rules.disallowedValues.put(field, values);
+                    }
+                } else if (section.startsWith("warn_disallowed:")) {
+                    String field = section.substring("warn_disallowed:".length());
+                    if (key.equals("values")) {
+                        Set<String> values = new HashSet<>();
+                        for (String entry : normalizeList(value)) {
+                            values.add(entry.toLowerCase(Locale.ROOT));
+                        }
+                        rules.warnDisallowedValues.put(field, values);
                     }
                 } else if (section.startsWith("date:")) {
                     String field = section.substring("date:".length());
@@ -963,6 +1346,16 @@ public class EligibilityOracle {
                         latest = LocalDate.parse(value);
                     }
                     rules.dateRanges.put(field, new DateRange(earliest, latest));
+                } else if (section.startsWith("warn_date:")) {
+                    String field = section.substring("warn_date:".length());
+                    LocalDate earliest = rules.warnDateRanges.containsKey(field) ? rules.warnDateRanges.get(field).earliest : LocalDate.MIN;
+                    LocalDate latest = rules.warnDateRanges.containsKey(field) ? rules.warnDateRanges.get(field).latest : LocalDate.MAX;
+                    if (key.equals("earliest")) {
+                        earliest = LocalDate.parse(value);
+                    } else if (key.equals("latest")) {
+                        latest = LocalDate.parse(value);
+                    }
+                    rules.warnDateRanges.put(field, new DateRange(earliest, latest));
                 } else if (section.startsWith("pattern:")) {
                     String field = section.substring("pattern:".length());
                     if (key.equals("regex")) {
@@ -970,6 +1363,15 @@ public class EligibilityOracle {
                             rules.patternRules.put(field, Pattern.compile(value));
                         } catch (PatternSyntaxException e) {
                             throw new IOException("Invalid regex for pattern:" + field + " -> " + e.getMessage(), e);
+                        }
+                    }
+                } else if (section.startsWith("warn_pattern:")) {
+                    String field = section.substring("warn_pattern:".length());
+                    if (key.equals("regex")) {
+                        try {
+                            rules.warnPatternRules.put(field, Pattern.compile(value));
+                        } catch (PatternSyntaxException e) {
+                            throw new IOException("Invalid regex for warn_pattern:" + field + " -> " + e.getMessage(), e);
                         }
                     }
                 } else if (section.equals("unique")) {
@@ -989,9 +1391,17 @@ public class EligibilityOracle {
             }
             rules.conditionalRequirements.addAll(conditionalLookup.values());
             rules.anyRequirements.addAll(anyLookup.values());
+            rules.warnConditionalRequirements.addAll(warnConditionalLookup.values());
+            rules.warnAnyRequirements.addAll(warnAnyLookup.values());
+            rules.reviewConditions.addAll(reviewLookup.values());
             rules.requiredFields.replaceAll(EligibilityOracle::normalize);
             rules.uniqueFields.replaceAll(EligibilityOracle::normalize);
+            rules.warnRequiredFields.replaceAll(EligibilityOracle::normalize);
+            rules.reviewMissingFields.replaceAll(EligibilityOracle::normalize);
             for (AnyRequirement requirement : rules.anyRequirements) {
+                requirement.fields.replaceAll(EligibilityOracle::normalize);
+            }
+            for (AnyRequirement requirement : rules.warnAnyRequirements) {
                 requirement.fields.replaceAll(EligibilityOracle::normalize);
             }
             return rules;
@@ -1030,6 +1440,17 @@ public class EligibilityOracle {
         }
     }
 
+    private static class ReviewCondition {
+        String conditionField;
+        String conditionValue;
+        List<String> reasons = new ArrayList<>();
+
+        ReviewCondition(String conditionField, String conditionValue) {
+            this.conditionField = conditionField;
+            this.conditionValue = conditionValue;
+        }
+    }
+
     private static String formatRate(int count, int total) {
         if (total == 0) {
             return "0.00%";
@@ -1060,11 +1481,23 @@ public class EligibilityOracle {
     private static List<String> buildTrackedFields(RuleSet rules) {
         LinkedHashMap<String, Boolean> fields = new LinkedHashMap<>();
         addAll(fields, rules.requiredFields);
+        addAll(fields, rules.reviewMissingFields);
         for (ConditionalRequirement requirement : rules.conditionalRequirements) {
             addAll(fields, Arrays.asList(requirement.conditionField));
             addAll(fields, requirement.requiredFields);
         }
+        for (ReviewCondition condition : rules.reviewConditions) {
+            addAll(fields, Arrays.asList(condition.conditionField));
+        }
         for (AnyRequirement requirement : rules.anyRequirements) {
+            addAll(fields, requirement.fields);
+        }
+        addAll(fields, rules.warnRequiredFields);
+        for (ConditionalRequirement requirement : rules.warnConditionalRequirements) {
+            addAll(fields, Arrays.asList(requirement.conditionField));
+            addAll(fields, requirement.requiredFields);
+        }
+        for (AnyRequirement requirement : rules.warnAnyRequirements) {
             addAll(fields, requirement.fields);
         }
         addAll(fields, rules.numericRanges.keySet());
@@ -1072,6 +1505,11 @@ public class EligibilityOracle {
         addAll(fields, rules.disallowedValues.keySet());
         addAll(fields, rules.dateRanges.keySet());
         addAll(fields, rules.patternRules.keySet());
+        addAll(fields, rules.warnNumericRanges.keySet());
+        addAll(fields, rules.warnAllowedValues.keySet());
+        addAll(fields, rules.warnDisallowedValues.keySet());
+        addAll(fields, rules.warnDateRanges.keySet());
+        addAll(fields, rules.warnPatternRules.keySet());
         addAll(fields, rules.uniqueFields);
         return new ArrayList<>(fields.keySet());
     }

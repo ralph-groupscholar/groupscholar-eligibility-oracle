@@ -33,6 +33,12 @@ Eligibility Oracle is a lightweight Java CLI that audits applicant intake CSVs a
 ./scripts/run.sh --input data/sample-intake.csv --rules data/rules.txt --segment-field status
 ```
 
+## Testing
+
+```bash
+./scripts/run_tests.sh
+```
+
 ## Database logging (optional)
 
 The Oracle can log audit summaries to Postgres for dashboards or longitudinal tracking.
@@ -63,6 +69,12 @@ fields=id,first_name,last_name,email,gpa,grad_year,status,dob
 
 [require_if:status=conditional]
 fields=review_notes
+
+[review_missing]
+fields=essay
+
+[review_if:status=conditional]
+reasons=manual_review
 
 [require_any:contact]
 fields=phone,guardian_email

@@ -1,5 +1,10 @@
 # Ralph Progress Log
 
+## Iteration 7 (2026-02-08)
+- Fixed missing review models in the audit engine so review flags compile and render correctly.
+- Added a smoke test script to validate text and JSON outputs from the CLI.
+- Documented the new test runner in the README.
+
 ## Iteration 73 (2026-02-08)
 - Added database logging for field completeness counts + missing-rate metrics.
 - Extended the production seed script to populate completeness rows and handle upgrades.
