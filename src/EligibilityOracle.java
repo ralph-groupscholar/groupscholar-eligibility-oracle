@@ -823,8 +823,10 @@ public class EligibilityOracle {
             insertReasonCounts(conn, config.schema, runId, result.reasonCategoryCounts, "audit_reason_categories", "category");
             insertReasonCounts(conn, config.schema, runId, result.warningCounts, "audit_warning_counts", "warning");
             insertReasonCounts(conn, config.schema, runId, result.warningCategoryCounts, "audit_warning_categories", "category");
+            insertReasonCounts(conn, config.schema, runId, result.reviewCounts, "audit_review_counts", "reason");
             insertFieldCompleteness(conn, config.schema, runId, result);
             insertFailures(conn, config.schema, runId, result.failures);
+            insertReviews(conn, config.schema, runId, result.reviews);
             insertSegments(conn, config.schema, runId, result);
             conn.commit();
             System.err.println("Logged audit to DB (run_id=" + runId + ").");
@@ -848,9 +850,15 @@ public class EligibilityOracle {
                 "ineligible INT NOT NULL," +
                 "eligible_rate NUMERIC(6,4) NOT NULL," +
                 "ineligible_rate NUMERIC(6,4) NOT NULL," +
+                "warning_applicants INT," +
+                "warning_rate NUMERIC(6,4)," +
+                "review_count INT," +
+                "review_rate NUMERIC(6,4)," +
                 "id_field TEXT NOT NULL," +
                 "failure_limit INT," +
-                "failures_truncated BOOLEAN NOT NULL" +
+                "failures_truncated BOOLEAN NOT NULL," +
+                "review_limit INT," +
+                "reviews_truncated BOOLEAN" +
                 ")";
         String reasonSql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_reason_counts (" +
                 "run_id BIGINT REFERENCES " + schema + ".audit_runs(id) ON DELETE CASCADE," +
@@ -872,6 +880,11 @@ public class EligibilityOracle {
                 "category TEXT NOT NULL," +
                 "count INT NOT NULL" +
                 ")";
+        String reviewSql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_review_counts (" +
+                "run_id BIGINT REFERENCES " + schema + ".audit_runs(id) ON DELETE CASCADE," +
+                "reason TEXT NOT NULL," +
+                "count INT NOT NULL" +
+                ")";
         String completenessSql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_field_completeness (" +
                 "run_id BIGINT REFERENCES " + schema + ".audit_runs(id) ON DELETE CASCADE," +
                 "field_name TEXT NOT NULL," +
@@ -879,6 +892,11 @@ public class EligibilityOracle {
                 "missing_rate NUMERIC(6,4) NOT NULL" +
                 ")";
         String failureSql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_failures (" +
+                "run_id BIGINT REFERENCES " + schema + ".audit_runs(id) ON DELETE CASCADE," +
+                "applicant_id TEXT NOT NULL," +
+                "reasons TEXT[] NOT NULL" +
+                ")";
+        String reviewFlagSql = "CREATE TABLE IF NOT EXISTS " + schema + ".audit_reviews (" +
                 "run_id BIGINT REFERENCES " + schema + ".audit_runs(id) ON DELETE CASCADE," +
                 "applicant_id TEXT NOT NULL," +
                 "reasons TEXT[] NOT NULL" +
@@ -896,6 +914,24 @@ public class EligibilityOracle {
         try (PreparedStatement stmt = conn.prepareStatement(runsSql)) {
             stmt.execute();
         }
+        try (PreparedStatement stmt = conn.prepareStatement("ALTER TABLE " + schema + ".audit_runs ADD COLUMN IF NOT EXISTS warning_applicants INT")) {
+            stmt.execute();
+        }
+        try (PreparedStatement stmt = conn.prepareStatement("ALTER TABLE " + schema + ".audit_runs ADD COLUMN IF NOT EXISTS warning_rate NUMERIC(6,4)")) {
+            stmt.execute();
+        }
+        try (PreparedStatement stmt = conn.prepareStatement("ALTER TABLE " + schema + ".audit_runs ADD COLUMN IF NOT EXISTS review_count INT")) {
+            stmt.execute();
+        }
+        try (PreparedStatement stmt = conn.prepareStatement("ALTER TABLE " + schema + ".audit_runs ADD COLUMN IF NOT EXISTS review_rate NUMERIC(6,4)")) {
+            stmt.execute();
+        }
+        try (PreparedStatement stmt = conn.prepareStatement("ALTER TABLE " + schema + ".audit_runs ADD COLUMN IF NOT EXISTS review_limit INT")) {
+            stmt.execute();
+        }
+        try (PreparedStatement stmt = conn.prepareStatement("ALTER TABLE " + schema + ".audit_runs ADD COLUMN IF NOT EXISTS reviews_truncated BOOLEAN")) {
+            stmt.execute();
+        }
         try (PreparedStatement stmt = conn.prepareStatement(reasonSql)) {
             stmt.execute();
         }
@@ -908,10 +944,16 @@ public class EligibilityOracle {
         try (PreparedStatement stmt = conn.prepareStatement(warningCategorySql)) {
             stmt.execute();
         }
+        try (PreparedStatement stmt = conn.prepareStatement(reviewSql)) {
+            stmt.execute();
+        }
         try (PreparedStatement stmt = conn.prepareStatement(completenessSql)) {
             stmt.execute();
         }
         try (PreparedStatement stmt = conn.prepareStatement(failureSql)) {
+            stmt.execute();
+        }
+        try (PreparedStatement stmt = conn.prepareStatement(reviewFlagSql)) {
             stmt.execute();
         }
         try (PreparedStatement stmt = conn.prepareStatement(segmentSql)) {
@@ -922,9 +964,11 @@ public class EligibilityOracle {
     private static long insertAuditRun(Connection conn, String schema, AuditResult result, Path inputPath, Path rulesPath, String runName) throws SQLException {
         double eligibleRate = result.totalRows == 0 ? 0.0 : (result.eligible * 1.0) / result.totalRows;
         double ineligibleRate = result.totalRows == 0 ? 0.0 : (result.ineligible * 1.0) / result.totalRows;
+        double warningRate = result.totalRows == 0 ? 0.0 : (result.warningApplicants * 1.0) / result.totalRows;
+        double reviewRate = result.totalRows == 0 ? 0.0 : (result.reviewCount * 1.0) / result.totalRows;
         String sql = "INSERT INTO " + schema + ".audit_runs " +
-                "(run_at, run_name, input_file, rules_file, total_applicants, eligible, ineligible, eligible_rate, ineligible_rate, id_field, failure_limit, failures_truncated) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id";
+                "(run_at, run_name, input_file, rules_file, total_applicants, eligible, ineligible, eligible_rate, ineligible_rate, warning_applicants, warning_rate, review_count, review_rate, id_field, failure_limit, failures_truncated, review_limit, reviews_truncated) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id";
         try (PreparedStatement stmt = conn.prepareStatement(sql)) {
             stmt.setObject(1, OffsetDateTime.now());
             stmt.setString(2, runName);
@@ -935,13 +979,23 @@ public class EligibilityOracle {
             stmt.setInt(7, result.ineligible);
             stmt.setBigDecimal(8, java.math.BigDecimal.valueOf(eligibleRate));
             stmt.setBigDecimal(9, java.math.BigDecimal.valueOf(ineligibleRate));
-            stmt.setString(10, result.idField);
+            stmt.setInt(10, result.warningApplicants);
+            stmt.setBigDecimal(11, java.math.BigDecimal.valueOf(warningRate));
+            stmt.setInt(12, result.reviewCount);
+            stmt.setBigDecimal(13, java.math.BigDecimal.valueOf(reviewRate));
+            stmt.setString(14, result.idField);
             if (result.failureLimit >= 0) {
-                stmt.setInt(11, result.failureLimit);
+                stmt.setInt(15, result.failureLimit);
             } else {
-                stmt.setNull(11, java.sql.Types.INTEGER);
+                stmt.setNull(15, java.sql.Types.INTEGER);
             }
-            stmt.setBoolean(12, result.failuresTruncated);
+            stmt.setBoolean(16, result.failuresTruncated);
+            if (result.reviewLimit >= 0) {
+                stmt.setInt(17, result.reviewLimit);
+            } else {
+                stmt.setNull(17, java.sql.Types.INTEGER);
+            }
+            stmt.setBoolean(18, result.reviewsTruncated);
             try (ResultSet rs = stmt.executeQuery()) {
                 if (rs.next()) {
                     return rs.getLong(1);
@@ -992,6 +1046,23 @@ public class EligibilityOracle {
         String sql = "INSERT INTO " + schema + ".audit_failures (run_id, applicant_id, reasons) VALUES (?, ?, ?)";
         try (PreparedStatement stmt = conn.prepareStatement(sql)) {
             for (FailureRecord record : failures) {
+                stmt.setLong(1, runId);
+                stmt.setString(2, record.id);
+                Array reasonArray = conn.createArrayOf("text", record.reasons.toArray());
+                stmt.setArray(3, reasonArray);
+                stmt.addBatch();
+            }
+            stmt.executeBatch();
+        }
+    }
+
+    private static void insertReviews(Connection conn, String schema, long runId, List<ReviewRecord> reviews) throws SQLException {
+        if (reviews.isEmpty()) {
+            return;
+        }
+        String sql = "INSERT INTO " + schema + ".audit_reviews (run_id, applicant_id, reasons) VALUES (?, ?, ?)";
+        try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+            for (ReviewRecord record : reviews) {
                 stmt.setLong(1, runId);
                 stmt.setString(2, record.id);
                 Array reasonArray = conn.createArrayOf("text", record.reasons.toArray());

@@ -1,5 +1,10 @@
 # Ralph Progress Log
 
+## Iteration 83 (2026-02-08)
+- Persisted review flag counts and review applicant details to Postgres alongside warning rates.
+- Expanded audit run metadata in Postgres to capture warning/review rates plus review truncation info.
+- Updated seed data and sample rules to include review flags for richer demo outputs.
+
 ## Iteration 7 (2026-02-08)
 - Fixed missing review models in the audit engine so review flags compile and render correctly.
 - Added a smoke test script to validate text and JSON outputs from the CLI.

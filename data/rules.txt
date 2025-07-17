@@ -9,6 +9,12 @@ fields=review_notes
 [require_any:contact]
 fields=phone,guardian_email
 
+[review_missing]
+fields=review_notes
+
+[review_if:status=conditional]
+reasons=manual_review
+
 [range:gpa]
 min=2.5
 max=4.0
@@ -20,6 +26,9 @@ max=2030
 [allowed:status]
 values=eligible,conditional
 
+[disallowed:review_notes]
+values=unknown,tbd
+
 [date:dob]
 earliest=1998-01-01
 latest=2008-12-31
@@ -29,3 +38,9 @@ regex=^.+@.+\..+$
 
 [unique]
 fields=email
+
+[aliases]
+id=applicant_id,student_id
+grad_year=graduation_year
+guardian_email=parent_email,guardian_email_address
+review_notes=review_note,notes

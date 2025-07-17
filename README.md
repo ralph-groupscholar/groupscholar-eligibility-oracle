@@ -42,7 +42,7 @@ Eligibility Oracle is a lightweight Java CLI that audits applicant intake CSVs a
 ## Database logging (optional)
 
 The Oracle can log audit summaries to Postgres for dashboards or longitudinal tracking.
-Field completeness counts are stored alongside reason metrics for intake quality monitoring.
+Field completeness counts are stored alongside reason metrics, warning tallies, and review flag summaries for intake quality monitoring.
 
 ```bash
 export ELIGIBILITY_DB_URL="jdbc:postgresql://db-acupinir.groupscholar.com:23947/postgres?sslmode=require"
