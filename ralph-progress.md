@@ -1,5 +1,9 @@
 # Ralph Progress Log
 
+## Iteration 84 (2026-02-08)
+- Normalized allowed/disallowed value comparisons so space/case variants map to rules consistently.
+- Documented value normalization behavior in the rules README section.
+
 ## Iteration 83 (2026-02-08)
 - Persisted review flag counts and review applicant details to Postgres alongside warning rates.
 - Expanded audit run metadata in Postgres to capture warning/review rates plus review truncation info.

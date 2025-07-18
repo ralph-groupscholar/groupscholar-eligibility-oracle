@@ -212,22 +212,22 @@ public class EligibilityOracle {
 
             for (Map.Entry<String, Set<String>> entry : rules.allowedValues.entrySet()) {
                 String field = entry.getKey();
-                String value = rowMap.getOrDefault(field, "");
+                String value = normalizeValue(rowMap.getOrDefault(field, ""));
                 if (value.isBlank()) {
                     continue;
                 }
-                if (!entry.getValue().contains(value.toLowerCase(Locale.ROOT))) {
+                if (!entry.getValue().contains(value)) {
                     reasons.add("disallowed:" + field);
                 }
             }
 
             for (Map.Entry<String, Set<String>> entry : rules.disallowedValues.entrySet()) {
                 String field = entry.getKey();
-                String value = rowMap.getOrDefault(field, "");
+                String value = normalizeValue(rowMap.getOrDefault(field, ""));
                 if (value.isBlank()) {
                     continue;
                 }
-                if (entry.getValue().contains(value.toLowerCase(Locale.ROOT))) {
+                if (entry.getValue().contains(value)) {
                     reasons.add("blocked:" + field);
                 }
             }
@@ -310,22 +310,22 @@ public class EligibilityOracle {
 
             for (Map.Entry<String, Set<String>> entry : rules.warnAllowedValues.entrySet()) {
                 String field = entry.getKey();
-                String value = rowMap.getOrDefault(field, "");
+                String value = normalizeValue(rowMap.getOrDefault(field, ""));
                 if (value.isBlank()) {
                     continue;
                 }
-                if (!entry.getValue().contains(value.toLowerCase(Locale.ROOT))) {
+                if (!entry.getValue().contains(value)) {
                     warnings.add("warn_disallowed:" + field);
                 }
             }
 
             for (Map.Entry<String, Set<String>> entry : rules.warnDisallowedValues.entrySet()) {
                 String field = entry.getKey();
-                String value = rowMap.getOrDefault(field, "");
+                String value = normalizeValue(rowMap.getOrDefault(field, ""));
                 if (value.isBlank()) {
                     continue;
                 }
-                if (entry.getValue().contains(value.toLowerCase(Locale.ROOT))) {
+                if (entry.getValue().contains(value)) {
                     warnings.add("warn_blocked:" + field);
                 }
             }

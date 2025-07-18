@@ -110,6 +110,8 @@ guardian_email=parent_email,guardian_email_address
 review_notes=review_note,notes
 ```
 
+Value comparisons for allowed/disallowed lists are normalized (trimmed, lowercased, spaces replaced with underscores) to reduce casing mismatches.
+
 ## Tech
 - Java (standard library)
 - PostgreSQL (optional analytics logging)
